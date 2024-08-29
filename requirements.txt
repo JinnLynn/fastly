@@ -1,0 +1,6 @@
+Werkzeug==3.0.4
+Flask==3.0.3
+Flask_AutoIndex
+Flask-HTTPAuth
+requests
+python-dateutil

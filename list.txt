@@ -1,0 +1,9 @@
+# gfwlist
+https://raw.githubusercontent.com/gfwlist/gfwlist/master/gfwlist.txt
+https://raw.githubusercontent.com/gfwlist/tinylist/master/tinylist.txt
+
+# IP
+https://raw.githubusercontent.com/gaoyifan/china-operator-ip/ip-lists/china6.txt
+https://raw.githubusercontent.com/gaoyifan/china-operator-ip/ip-lists/china.txt
+https://raw.githubusercontent.com/sapics/ip-location-db/main/geolite2-country/geolite2-country-ipv6.csv
+https://raw.githubusercontent.com/sapics/ip-location-db/main/geolite2-country/geolite2-country-ipv4.csv
