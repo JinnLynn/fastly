@@ -41,5 +41,5 @@ jobs:
                         --token ${{ secrets.REMOTE_TOKEN }}
 
           echo [$(date "+%Y-%m-%d %H:%M:%S")] "Sync to server..."
-          flask sync --path /app/local/
+          flask sync --path /app/local/fastly/
           echo [$(date "+%Y-%m-%d %H:%M:%S")] "Done."
