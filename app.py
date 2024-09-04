@@ -43,12 +43,18 @@ DEF_CONFIGS = {
     'sync': {},
     'download_max_workers': 25,
     'download_timeout': (5, 30),
+    'mimetypes': {
+        'text/plain': ['.m3u', '.m3u8', '.yml', '.yaml', '.toml']
+    },
     'SECRET_KEY': ''.join(random.choices(string.ascii_letters + string.digits, k=64)),
 }
+
 
 class Config(Namespace):
     def __init__(self, app):
         data = self._load(app, os.getenv('FASTLY_CONFIG', 'config.toml'))
+        if app:
+            app.fastly = self
         super().__init__(**data)
 
     def _load(self, app: Flask, cf):
@@ -68,18 +74,17 @@ class Config(Namespace):
     def get(self, name, default=None):
         return self.__dict__.get(name, default)
 
-def dispatch_github_action(app, config, *args, **kwargs):
-    app.logger.info('github action')
-    return False
-    if not config.github_token or not config.github_repository:
+
+def dispatch_github_action(app, *args, **kwargs):
+    if not app.fastly.github_token or not app.fastly.github_repository:
         app.logger.error('Github token or repository missing.')
         return False
     headers = {
         'Accept': 'application/vnd.github.everest-preview+json',
-        'Authorization': f'token {config.github_token}'
+        'Authorization': f'token {app.fastly.github_token}'
     }
     try:
-        res = requests.post(f'https://api.github.com/repos/{config.github_repository}/dispatches',
+        res = requests.post(f'https://api.github.com/repos/{app.fastly.github_repository}/dispatches',
                             json={'event_type': 'download'}, headers=headers)
         res.raise_for_status()
         if res.status_code == 204:
@@ -89,11 +94,11 @@ def dispatch_github_action(app, config, *args, **kwargs):
         app.logger.error('Dispatch Github-action job fail.')
     return False
 
+
 class WatchHandler(FileSystemEventHandler):
-    def __init__(self, app, config):
+    def __init__(self, app):
         super().__init__()
         self.app = app
-        self.config = config
 
     def on_any_event(self, event):
         active_events = [EVENT_TYPE_MOVED, EVENT_TYPE_DELETED, EVENT_TYPE_CREATED, EVENT_TYPE_MODIFIED]
@@ -103,49 +108,59 @@ class WatchHandler(FileSystemEventHandler):
         app.logger.info(f'File Event[{event.event_type}]: {event.src_path}')
         # 添加到一次任务延时执行，防止多次响应
         app.apscheduler.add_job('dowonload_when_list_change', dispatch_github_action,
-                                     trigger='date', run_date=datetime.now() + timedelta(seconds=3),
-                                     args=(self.app, self.config), kwargs={'event': 'WATCH'},
-                                     replace_existing=True)
+                                trigger='date', run_date=datetime.now() + timedelta(seconds=3),
+                                args=(self.app, ), kwargs={'event': 'WATCH'},
+                                replace_existing=True)
 
-def start_watch_list(app, config):
-    def watch_process(app, config):
+
+def start_watch_list(app):
+    def watch_process(app):
         observer = Observer()
-        event_handler = WatchHandler(app, config)
-        observer.schedule(event_handler, config.list_dir, recursive=True)
+        event_handler = WatchHandler(app)
+        observer.schedule(event_handler, app.fastly.list_dir, recursive=True)
         observer.start()
-        app.logger.info(f'Watch: {config.list_dir}')
+        app.logger.info(f'Watch: {app.fastly.list_dir}')
 
-    thread = threading.Thread(target=watch_process, args=[app, config], daemon=True)
+    thread = threading.Thread(target=watch_process, args=[app], daemon=True)
     thread.start()
     return thread
 
-# ===
-app = Flask(__name__)
-config = Config(app)
-auto_index = AutoIndex(app, browse_root=config.dist_dir, add_url_rules=False)
 
-# AUTH
-_digest_auth = HTTPDigestAuth()
-_digest_auth.get_password_callback = lambda u: config.auth_pwd if u == config.auth_usr else None
-_token_auth = HTTPTokenAuth()
-_token_auth.verify_token_callback = lambda t: config.auth_usr if t == config.auth_token else None
-auth = MultiAuth(_digest_auth, _token_auth)
+def create_app():
+    app = Flask(__name__)
 
-scheduler = APScheduler(app=app)
-if config.watch_list:
-    start_watch_list(app, config)
-scheduler.start()
+    for hdl in app.logger.handlers:
+        app.logger.removeHandler(hdl)
+    hdl = logging.StreamHandler()
+    hdl.setFormatter(logging.Formatter('[%(asctime)s][%(levelname)s] %(message)s'))
+    app.logger.addHandler(hdl)
+    if not app.debug:
+        app.logger.setLevel(logging.INFO)
 
-logging.basicConfig(
-        format='[%(asctime)s][%(levelname)s] %(message)s',
-        handlers=[logging.StreamHandler()])
-if not app.debug:
-    app.logger.setLevel(logging.INFO)
+    config = Config(app)
+    app.extensions['auto_index'] = AutoIndex(app, browse_root=config.dist_dir, add_url_rules=False)
 
-for ext in DEF_TEXT_TYPES:
-    mimetypes.add_type('text/plain', ext)
+    # AUTH
+    _digest_auth = HTTPDigestAuth()
+    _digest_auth.get_password_callback = lambda u: config.auth_pwd if u == config.auth_usr else None
+    _token_auth = HTTPTokenAuth()
+    _token_auth.verify_token_callback = lambda t: config.auth_usr if t == config.auth_token else None
+    app.extensions['auth'] = MultiAuth(_digest_auth, _token_auth)
 
-# app.logger.info(f'AUTH: USR: {config.auth_usr} PWD: {config.auth_pwd} TOKEN: {config.auth_token}')
+    scheduler = APScheduler(app=app)
+    if config.watch_list:
+        start_watch_list(app)
+    scheduler.start()
+
+    for t, exts in config.mimetypes.items():
+        for ext in exts:
+            mimetypes.add_type(t, ext)
+
+    return app
+
+
+app = create_app()
+
 
 def _re_subs(s, *reps):
     d = (None, '', 0, re.IGNORECASE)
@@ -156,29 +171,25 @@ def _re_subs(s, *reps):
         s = re.sub(*rep)
     return s
 
+
 def calc_hash(*args):
     m = hashlib.sha256()
     for s in args:
         m.update(s.encode())
     return m.hexdigest()[0:12]
 
+
 def is_url(s):
     parts = urlparse(s)
     return parts.scheme and parts.netloc
+
 
 def clear_scheme(url):
     p = urlparse(url)
     return re.sub(fr'^{p.scheme}:/+', '', url)
 
+
 # FIX: 地址中有query时还有问题
-URL2PATH_TEST = [
-    ('http://example.com/path/to/file.ext',                 'example.com/path/to/file.ext'),
-    ('http://example.com:port/path/to/file.ext',            'example.com/port/path/to/file.ext'),
-    ('http://example.com:port/path/to/file space name.ext', 'example.com/port/path/to/file-space-name.ext'),
-    ('http://example.com/',                                 'example.com/73d986e00906'),
-    ('http://example.com/path/to/dir/',                     'example.com/path/to/dir/25d5ecf6aa8d'),
-    ('http://example.com/path/to/dir/?a=1&b=2',             'example.com/path/to/dir/8702068bde16'),
-]
 def to_path(s):
     parts = urlparse(s)
     netloc = '/'.join(parts.netloc.split(':'))                     # 网址端口转为子目录
@@ -194,11 +205,13 @@ def to_path(s):
         relpath = os.path.join(relpath, calc_hash(relpath))
     return relpath
 
+
 def get_abspath(relpath, mkdir=True):
-    abspath = os.path.join(config.dist_dir, relpath)
+    abspath = os.path.join(app.fastly.dist_dir, relpath)
     if mkdir and not os.path.isdir(os.path.dirname(abspath)):
         os.makedirs(os.path.dirname(abspath))
     return abspath
+
 
 def send_file(url_or_path):
     relpath = to_path(url_or_path)
@@ -209,6 +222,7 @@ def send_file(url_or_path):
     app.logger.warning(f'NotFound: {url_or_path} => {relpath}')
     raise NotFound()
 
+
 def read_urls(content):
     valids = []
     for line in content.splitlines():
@@ -218,20 +232,22 @@ def read_urls(content):
         valids.append(line)
     return valids
 
+
 def get_urls():
     urls = set()
-    for f in glob('*.txt', root_dir=config.list_dir):
+    for f in glob('*.txt', root_dir=app.fastly.list_dir):
         try:
-            with open(os.path.join(config.list_dir, f)) as fp:
+            with open(os.path.join(app.fastly.list_dir, f)) as fp:
                 fp.read
                 urls.update(read_urls(fp.read()))
         except Exception as e:
             logging.error(f'read list fail: {f} {e}')
     return list(urls)
 
+
 def download_single(url):
     try:
-        res = requests.get(url, allow_redirects=True, timeout=config.download_timeout)
+        res = requests.get(url, allow_redirects=True, timeout=app.fastly.download_timeout)
         res.raise_for_status()
         relpath = to_path(url)
         abspath = get_abspath(relpath)
@@ -253,10 +269,11 @@ def download_single(url):
             app.logger.error(f'DL {type(e).__name__}: {url} {e}')
     return False
 
+
 def download(urls):
     success_count = 0
     start = datetime.now()
-    with ThreadPoolExecutor(max_workers=config.download_max_workers) as executor:
+    with ThreadPoolExecutor(max_workers=app.fastly.download_max_workers) as executor:
         futures = [executor.submit(download_single, url) for url in urls]
         for future in as_completed(futures):
             if future.result():
@@ -264,10 +281,12 @@ def download(urls):
     dt = datetime.now() - start
     app.logger.info(f'done. {dt.total_seconds():.3f}s {success_count}/{len(urls)}')
 
+
 def download_local():
     app.logger.info('Download local list...')
     urls = get_urls()
     download(urls)
+
 
 def download_remote(remote, token):
     app.logger.info(f'Download remote list...')
@@ -285,11 +304,13 @@ def download_remote(remote, token):
         else:
             app.logger.error(f'Download remote fail: {e.__class__.__name__}')
 
+
 @app.route('/')
 def index():
     if 'q' in request.args:
         return redirect(url_for('serve_file', target=request.args.get('q')))
-    return redirect('https://lins.ren')
+    return ' ', 404
+
 
 @app.route('/<path:target>')
 def serve_file(target):
@@ -300,16 +321,19 @@ def serve_file(target):
         return redirect(url_for('serve_file', target=target))
     return send_file(target)
 
+
 @app.route('/-/list/')
 @app.route('/-/list/<path:path>')
-@auth.login_required
+@app.extensions['auth'].login_required
 def autoindex(path='.'):
-    return auto_index.render_autoindex(path)
+    return app.extensions['auto_index'].render_autoindex(path)
+
 
 @app.route('/-/urls/')
-@auth.login_required
+@app.extensions['auth'].login_required
 def dump_urls():
     return '\n'.join(get_urls())
+
 
 @app.cli.command('download')
 @click.option('--remote', default=None)
@@ -320,6 +344,7 @@ def cmd_download(**kwargs):
         return download_remote(remote, kwargs.get('token'))
     return download_local()
 
+
 @app.cli.command('sync')
 @click.option('--force', is_flag=True)
 @click.option('--host')
@@ -328,43 +353,26 @@ def cmd_download(**kwargs):
 @click.option('--key')
 @click.option('--path')
 def cmd_sync(**kwargs):
-    host = kwargs.get('host') or os.getenv('DST_HOST') or config.sync.get('host')
-    port = kwargs.get('port') or os.getenv('DST_PORT') or config.sync.get('port', 22)
-    usr = kwargs.get('usr') or os.getenv('DST_USER') or config.sync.get('user', 'root')
-    key = kwargs.get('key') or os.getenv('DST_KEY') or config.sync.get('key')
-    dest = kwargs.get('path') or  os.getenv('DST_PATH') or config.sync.get('path')
+    host = kwargs.get('host') or os.getenv('DST_HOST') or app.fastly.sync.get('host')
+    port = kwargs.get('port') or os.getenv('DST_PORT') or app.fastly.sync.get('port', 22)
+    usr = kwargs.get('usr') or os.getenv('DST_USER') or app.fastly.sync.get('user', 'root')
+    key = kwargs.get('key') or os.getenv('DST_KEY') or app.fastly.sync.get('key')
+    dest = kwargs.get('path') or  os.getenv('DST_PATH') or app.fastly.sync.get('path')
 
     extra_args = '--delete --delete-excluded' if kwargs.get('force') else ''
     rsh = f'ssh -p {port}'
     if key:
         rsh += f' -i {key}'
-    cmd = f'rsync -rlth --checksum --ignore-errors --stats {extra_args} -e "{rsh}" "{config.dist_dir}/" "{usr}@{host}:{dest}"'
+    cmd = f'rsync -rlth --checksum --ignore-errors --stats {extra_args} -e "{rsh}" "{app.fastly.dist_dir}/" "{usr}@{host}:{dest}"'
     try:
         app.logger.info('sync to server...')
         proc = subprocess.Popen(shlex.split(cmd))
         proc.wait()
     except Exception as e:
-        logging.error(f'sync fail: {e}')
+        app.logger.error(f'sync fail: {e}')
         raise SystemExit(code=1)
+
 
 @app.cli.command('action')
 def cmd_github_action():
-    dispatch_github_action()
-
-
-@app.cli.command('test')
-@click.option('--caps', is_flag=True, help='uppercase the output')
-def cmd_test(caps):
-    print(caps)
-    return
-    # with open('config.ini', 'rb') as fp:
-    #     print(load_ini_file(fp))
-
-    # print(calc_hash('example.com/path/to/dir/', 'a=1&b=2'))
-    for url, path in URL2PATH_TEST:
-        p = to_path(url)
-        try:
-            assert path == p
-            assert to_path(path) == path
-        except AssertionError:
-            app.logger.error(f'URL2PATH: {url} {path} {p}')
+    dispatch_github_action(app)
