@@ -3,7 +3,7 @@ import sys
 import re
 import logging
 from urllib.parse import urlparse
-from datetime import datetime
+from datetime import datetime, timedelta
 import mimetypes
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
@@ -14,16 +14,21 @@ import shlex
 import tomllib
 from argparse import Namespace
 from glob import glob
+import threading
 
 from flask import Flask, send_file as _send_file, redirect, request, url_for
 from werkzeug.exceptions import NotFound
 from flask_autoindex import AutoIndex
 from flask_httpauth import HTTPDigestAuth, HTTPTokenAuth, MultiAuth
+from flask_apscheduler import APScheduler
 import requests
 from requests.exceptions import HTTPError
 from requests import status_codes
 from dateutil import parser, tz
 import click
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler, \
+    EVENT_TYPE_MOVED, EVENT_TYPE_DELETED, EVENT_TYPE_CREATED, EVENT_TYPE_MODIFIED
 
 privacy = os.getenv('FASTLY_PRIVACY')
 
@@ -47,6 +52,7 @@ class Config(Namespace):
         super().__init__(**data)
 
     def _load(self, app: Flask, cf):
+        app.logger.debug(f'Config: {cf}')
         with open(cf, 'rb') as fp:
             data = tomllib.load(fp)
         for k, v in DEF_CONFIGS.items():
@@ -61,8 +67,59 @@ class Config(Namespace):
 
     def get(self, name, default=None):
         return self.__dict__.get(name, default)
-# ===
 
+def dispatch_github_action(app, config, *args, **kwargs):
+    app.logger.info('github action')
+    return False
+    if not config.github_token or not config.github_repository:
+        app.logger.error('Github token or repository missing.')
+        return False
+    headers = {
+        'Accept': 'application/vnd.github.everest-preview+json',
+        'Authorization': f'token {config.github_token}'
+    }
+    try:
+        res = requests.post(f'https://api.github.com/repos/{config.github_repository}/dispatches',
+                            json={'event_type': 'download'}, headers=headers)
+        res.raise_for_status()
+        if res.status_code == 204:
+            app.logger.info('Github Action job dispatched.')
+            return True
+    except:
+        app.logger.error('Dispatch Github-action job fail.')
+    return False
+
+class WatchHandler(FileSystemEventHandler):
+    def __init__(self, app, config):
+        super().__init__()
+        self.app = app
+        self.config = config
+
+    def on_any_event(self, event):
+        active_events = [EVENT_TYPE_MOVED, EVENT_TYPE_DELETED, EVENT_TYPE_CREATED, EVENT_TYPE_MODIFIED]
+        if event.is_directory or event.event_type not in active_events:
+            return None
+
+        app.logger.info(f'File Event[{event.event_type}]: {event.src_path}')
+        # 添加到一次任务延时执行，防止多次响应
+        app.apscheduler.add_job('dowonload_when_list_change', dispatch_github_action,
+                                     trigger='date', run_date=datetime.now() + timedelta(seconds=3),
+                                     args=(self.app, self.config), kwargs={'event': 'WATCH'},
+                                     replace_existing=True)
+
+def start_watch_list(app, config):
+    def watch_process(app, config):
+        observer = Observer()
+        event_handler = WatchHandler(app, config)
+        observer.schedule(event_handler, config.list_dir, recursive=True)
+        observer.start()
+        app.logger.info(f'Watch: {config.list_dir}')
+
+    thread = threading.Thread(target=watch_process, args=[app, config], daemon=True)
+    thread.start()
+    return thread
+
+# ===
 app = Flask(__name__)
 config = Config(app)
 auto_index = AutoIndex(app, browse_root=config.dist_dir, add_url_rules=False)
@@ -73,6 +130,11 @@ _digest_auth.get_password_callback = lambda u: config.auth_pwd if u == config.au
 _token_auth = HTTPTokenAuth()
 _token_auth.verify_token_callback = lambda t: config.auth_usr if t == config.auth_token else None
 auth = MultiAuth(_digest_auth, _token_auth)
+
+scheduler = APScheduler(app=app)
+if config.watch_list:
+    start_watch_list(app, config)
+scheduler.start()
 
 logging.basicConfig(
         format='[%(asctime)s][%(levelname)s] %(message)s',
@@ -284,6 +346,11 @@ def cmd_sync(**kwargs):
     except Exception as e:
         logging.error(f'sync fail: {e}')
         raise SystemExit(code=1)
+
+@app.cli.command('action')
+def cmd_github_action():
+    dispatch_github_action()
+
 
 @app.cli.command('test')
 @click.option('--caps', is_flag=True, help='uppercase the output')

@@ -4,3 +4,5 @@ Flask_AutoIndex
 Flask-HTTPAuth
 requests
 python-dateutil
+watchdog~=5.0
+Flask-APScheduler~=1.13
