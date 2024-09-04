@@ -1,0 +1,45 @@
+name: fastly
+on:
+  workflow_dispatch:
+    inputs:
+      force_sync:
+        default: false
+        required: true
+        type: boolean
+        description: delete files from dest
+  schedule:
+    - cron: "0 */6 * * *"
+  repository_dispatch:
+    types: [download]
+env:
+  FORCE_SYNC: ${{ inputs.force_sync }}
+  DST_HOST: ${{ secrets.DST_HOST }}
+  DST_PORT: ${{ secrets.DST_PORT }}
+  FASTLY_PRIVACY: 1
+jobs:
+  automate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+            ssh-private-key: ${{ secrets.DST_SSH_KEY }}
+      - uses: actions/checkout@v4
+      - name: run
+        run: |
+          set -e
+
+          echo [$(date "+%Y-%m-%d %H:%M:%S")] "Init..."
+          [ -n "$DST_HOST" ] && \
+              ssh-keyscan ${DST_PORT+-p $DST_PORT} ${DST_HOST} > ~/.ssh/known_hosts
+          pip install --disable-pip-version-check -q -r requirements.txt
+
+          echo [$(date "+%Y-%m-%d %H:%M:%S")] "Download..."
+          flask download --remote ${{ secrets.REMOTE_LIST }} \
+                        --token ${{ secrets.REMOTE_TOKEN }}
+
+          echo [$(date "+%Y-%m-%d %H:%M:%S")] "Sync to server..."
+          flask sync --path /app/local/
+          echo [$(date "+%Y-%m-%d %H:%M:%S")] "Done."

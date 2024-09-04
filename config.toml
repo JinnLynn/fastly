@@ -1,0 +1,13 @@
+dist_dir = "dist"
+list_dir = "list"
+
+# auth_usr = "fastly"
+# auth_pwd = "__PASSWORD__"
+# auth_token = "__TOKEN__"
+
+# [sync]
+# host = "__SERVER__"
+# port = 22
+# user = "root"
+# path = "__SERVER_DEST_PATH"
+# key = "__SERVER_SSH_KEY__"

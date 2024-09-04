@@ -12,3 +12,10 @@ trim_trailing_whitespace = true
 [*.txt]
 insert_final_newline = false
 trim_trailing_whitespace = false
+
+[*.{yaml,yml}]
+indent_size = 2
+trim_trailing_whitespace = true
+
+[*.toml]
+trim_trailing_whitespace = true

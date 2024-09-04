@@ -1,4 +1,5 @@
 import os
+import sys
 import re
 import logging
 from urllib.parse import urlparse
@@ -8,29 +9,70 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import string
 import random
+import subprocess
+import shlex
+import tomllib
+from argparse import Namespace
+from glob import glob
 
 from flask import Flask, send_file as _send_file, redirect, request, url_for
 from werkzeug.exceptions import NotFound
 from flask_autoindex import AutoIndex
-from flask_httpauth import HTTPDigestAuth
+from flask_httpauth import HTTPDigestAuth, HTTPTokenAuth, MultiAuth
 import requests
+from requests.exceptions import HTTPError
+from requests import status_codes
 from dateutil import parser, tz
+import click
 
-DIST = os.getenv('FASTLY_DIST', './dist')
-LIST = os.getenv('FASTLY_LIST', './list.txt')
-AUTH_PWD = os.getenv('FASTLY_AUTH', ''.join(random.choices(string.ascii_letters + string.digits, k=24)))
+privacy = os.getenv('FASTLY_PRIVACY')
 
-DEF_AUTH_USR = 'fastly'
 DEF_TZ = tz.gettz('Asia/Shanghai')
-DEF_DOWNLOAD_TIMEOUT = (5, 30)
 DEF_TEXT_TYPES = ['.m3u', '.m3u8', '.yml', '.yaml']
+DEF_CONFIGS = {
+    'dist_dir': 'dist',
+    'list_dir': 'list',
+    'auth_usr': 'fastly',
+    'auth_pwd': ''.join(random.choices(string.ascii_letters + string.digits, k=32)),
+    'auth_token': ''.join(random.choices(string.ascii_letters + string.digits, k=32)),
+    'sync': {},
+    'download_max_workers': 25,
+    'download_timeout': (5, 30),
+    'SECRET_KEY': ''.join(random.choices(string.ascii_letters + string.digits, k=64)),
+}
 
+class Config(Namespace):
+    def __init__(self, app):
+        data = self._load(app, os.getenv('FASTLY_CONFIG', 'config.toml'))
+        super().__init__(**data)
+
+    def _load(self, app: Flask, cf):
+        with open(cf, 'rb') as fp:
+            data = tomllib.load(fp)
+        for k, v in DEF_CONFIGS.items():
+            data.setdefault(k, v)
+        data.update(dist_dir=os.path.join(app.root_path, data['dist_dir']),
+                    list_dir=os.path.join(app.root_path, data['list_dir']))
+        app.config.from_mapping(data)
+        return data
+
+    def __getattr__(self, name):
+        return self.get(name)
+
+    def get(self, name, default=None):
+        return self.__dict__.get(name, default)
 # ===
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = ''.join(random.choices(string.ascii_letters + string.digits, k=64))
-auto_index = AutoIndex(app, browse_root=DIST, add_url_rules=False)
-auth = HTTPDigestAuth()
+config = Config(app)
+auto_index = AutoIndex(app, browse_root=config.dist_dir, add_url_rules=False)
+
+# AUTH
+_digest_auth = HTTPDigestAuth()
+_digest_auth.get_password_callback = lambda u: config.auth_pwd if u == config.auth_usr else None
+_token_auth = HTTPTokenAuth()
+_token_auth.verify_token_callback = lambda t: config.auth_usr if t == config.auth_token else None
+auth = MultiAuth(_digest_auth, _token_auth)
 
 logging.basicConfig(
         format='[%(asctime)s][%(levelname)s] %(message)s',
@@ -41,13 +83,7 @@ if not app.debug:
 for ext in DEF_TEXT_TYPES:
     mimetypes.add_type('text/plain', ext)
 
-app.logger.info(f'AUTH: {DEF_AUTH_USR} {AUTH_PWD}')
-
-@auth.get_password
-def get_pw(usr):
-    if usr == DEF_AUTH_USR:
-        return AUTH_PWD
-    return None
+# app.logger.info(f'AUTH: USR: {config.auth_usr} PWD: {config.auth_pwd} TOKEN: {config.auth_token}')
 
 def _re_subs(s, *reps):
     d = (None, '', 0, re.IGNORECASE)
@@ -97,7 +133,7 @@ def to_path(s):
     return relpath
 
 def get_abspath(relpath, mkdir=True):
-    abspath = os.path.join(DIST, relpath)
+    abspath = os.path.join(config.dist_dir, relpath)
     if mkdir and not os.path.isdir(os.path.dirname(abspath)):
         os.makedirs(os.path.dirname(abspath))
     return abspath
@@ -111,56 +147,87 @@ def send_file(url_or_path):
     app.logger.warning(f'NotFound: {url_or_path} => {relpath}')
     raise NotFound()
 
+def read_urls(content):
+    valids = []
+    for line in content.splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        valids.append(line)
+    return valids
+
+def get_urls():
+    urls = set()
+    for f in glob('*.txt', root_dir=config.list_dir):
+        try:
+            with open(os.path.join(config.list_dir, f)) as fp:
+                fp.read
+                urls.update(read_urls(fp.read()))
+        except Exception as e:
+            logging.error(f'read list fail: {f} {e}')
+    return list(urls)
+
 def download_single(url):
     try:
-        res = requests.get(url, allow_redirects=True, timeout=DEF_DOWNLOAD_TIMEOUT)
+        res = requests.get(url, allow_redirects=True, timeout=config.download_timeout)
         res.raise_for_status()
         relpath = to_path(url)
         abspath = get_abspath(relpath)
         with open(abspath, 'wb') as fp:
             fp.write(res.content)
         try:
-            # modified = datetime.strptime(res.headers.get('last-modified'), '%a, %d %b %Y %H:%M:%S %Z')
             modified = parser.parse(res.headers.get('last-modified'))
             modified_local = modified.astimezone(tz=DEF_TZ)
             os.utime(abspath, (modified_local.timestamp(), modified_local.timestamp()))
-            app.logger.debug(f'file modified: {modified_local}')
         except:
             pass
-        app.logger.info(f'DL({res.elapsed.total_seconds():.2f}): {url} => {relpath}')
+        if not privacy:
+            app.logger.info(f'DL({res.elapsed.total_seconds():.2f}): {url} => {relpath}')
         return True
     except Exception as e:
-        app.logger.error(f'DL {type(e).__name__}: {url} {e}')
+        if privacy:
+            app.logger.error(f'DL {type(e).__name__}: {e}')
+        else:
+            app.logger.error(f'DL {type(e).__name__}: {url} {e}')
     return False
 
-def download():
-    urls = set()
-    with open(LIST) as fp:
-        for line in fp.readlines():
-            line = line.strip()
-            if not line or line.startswith('#'):
-                continue
-            urls.add(line)
-
+def download(urls):
     success_count = 0
-    with ThreadPoolExecutor(max_workers=20) as executor:
+    start = datetime.now()
+    with ThreadPoolExecutor(max_workers=config.download_max_workers) as executor:
         futures = [executor.submit(download_single, url) for url in urls]
         for future in as_completed(futures):
             if future.result():
                 success_count += 1
-    app.logger.info(f'done. {success_count}/{len(urls)}')
+    dt = datetime.now() - start
+    app.logger.info(f'done. {dt.total_seconds():.3f}s {success_count}/{len(urls)}')
+
+def download_local():
+    app.logger.info('Download local list...')
+    urls = get_urls()
+    download(urls)
+
+def download_remote(remote, token):
+    app.logger.info(f'Download remote list...')
+    try:
+        headers = {}
+        if token:
+            headers['Authorization'] = f'Bearer {token}'
+        res = requests.get(remote, headers=headers)
+        res.raise_for_status()
+        urls = read_urls(res.content.decode())
+        download(urls)
+    except Exception as e:
+        if isinstance(e, HTTPError):
+            app.logger.error(f'Download remote fail: {e.response.status_code}')
+        else:
+            app.logger.error(f'Download remote fail: {e.__class__.__name__}')
 
 @app.route('/')
 def index():
     if 'q' in request.args:
         return redirect(url_for('serve_file', target=request.args.get('q')))
     return redirect('https://lins.ren')
-
-@app.route('/raw/list/')
-@app.route('/raw/list/<path:path>')
-@auth.login_required
-def autoindex(path='.'):
-    return auto_index.render_autoindex(path)
 
 @app.route('/<path:target>')
 def serve_file(target):
@@ -171,12 +238,61 @@ def serve_file(target):
         return redirect(url_for('serve_file', target=target))
     return send_file(target)
 
+@app.route('/-/list/')
+@app.route('/-/list/<path:path>')
+@auth.login_required
+def autoindex(path='.'):
+    return auto_index.render_autoindex(path)
+
+@app.route('/-/urls/')
+@auth.login_required
+def dump_urls():
+    return '\n'.join(get_urls())
+
 @app.cli.command('download')
-def cmd_download():
-    download()
+@click.option('--remote', default=None)
+@click.option('--token', default=None)
+def cmd_download(**kwargs):
+    remote = kwargs.get('remote')
+    if remote:
+        return download_remote(remote, kwargs.get('token'))
+    return download_local()
+
+@app.cli.command('sync')
+@click.option('--force', is_flag=True)
+@click.option('--host')
+@click.option('--port')
+@click.option('--usr')
+@click.option('--key')
+@click.option('--path')
+def cmd_sync(**kwargs):
+    host = kwargs.get('host') or os.getenv('DST_HOST') or config.sync.get('host')
+    port = kwargs.get('port') or os.getenv('DST_PORT') or config.sync.get('port', 22)
+    usr = kwargs.get('usr') or os.getenv('DST_USER') or config.sync.get('user', 'root')
+    key = kwargs.get('key') or os.getenv('DST_KEY') or config.sync.get('key')
+    dest = kwargs.get('path') or  os.getenv('DST_PATH') or config.sync.get('path')
+
+    extra_args = '--delete --delete-excluded' if kwargs.get('force') else ''
+    rsh = f'ssh -p {port}'
+    if key:
+        rsh += f' -i {key}'
+    cmd = f'rsync -rlth --checksum --ignore-errors --stats {extra_args} -e "{rsh}" "{config.dist_dir}/" "{usr}@{host}:{dest}"'
+    try:
+        app.logger.info('sync to server...')
+        proc = subprocess.Popen(shlex.split(cmd))
+        proc.wait()
+    except Exception as e:
+        logging.error(f'sync fail: {e}')
+        raise SystemExit(code=1)
 
 @app.cli.command('test')
-def cmd_test():
+@click.option('--caps', is_flag=True, help='uppercase the output')
+def cmd_test(caps):
+    print(caps)
+    return
+    # with open('config.ini', 'rb') as fp:
+    #     print(load_ini_file(fp))
+
     # print(calc_hash('example.com/path/to/dir/', 'a=1&b=2'))
     for url, path in URL2PATH_TEST:
         p = to_path(url)
