@@ -13,9 +13,7 @@ on:
     types: [download]
 env:
   FORCE_SYNC: ${{ inputs.force_sync }}
-  DST_HOST: ${{ secrets.DST_HOST }}
-  DST_PORT: ${{ secrets.DST_PORT }}
-  FASTLY_PRIVACY: 1
+  # FASTLY_PRIVACY: 1
 jobs:
   automate:
     runs-on: ubuntu-24.04
@@ -32,14 +30,11 @@ jobs:
           set -e
 
           echo [$(date "+%Y-%m-%d %H:%M:%S")] "Init..."
-          [ -n "$DST_HOST" ] && \
-              ssh-keyscan ${DST_PORT+-p $DST_PORT} ${DST_HOST} > ~/.ssh/known_hosts
           pip install --disable-pip-version-check -q -r requirements.txt
 
           echo [$(date "+%Y-%m-%d %H:%M:%S")] "Download..."
-          flask download --remote ${{ secrets.REMOTE_LIST }} \
-                        --token ${{ secrets.REMOTE_TOKEN }}
+          flask download --remote ${{ secrets.REMOTE_JOB }} \
+                        --token ${{ secrets.REMOTE_TOKEN }} \
+                        --sync --callback
 
-          echo [$(date "+%Y-%m-%d %H:%M:%S")] "Sync to server..."
-          flask sync --path /app/local/fastly/
           echo [$(date "+%Y-%m-%d %H:%M:%S")] "Done."

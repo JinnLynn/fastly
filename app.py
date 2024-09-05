@@ -4,6 +4,7 @@ import re
 import logging
 from urllib.parse import urlparse
 from datetime import datetime, timedelta
+import time
 import mimetypes
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
@@ -15,15 +16,15 @@ import tomllib
 from argparse import Namespace
 from glob import glob
 import threading
+import json
 
-from flask import Flask, send_file as _send_file, redirect, request, url_for
+from flask import Flask, send_file as _send_file, redirect, request, url_for, jsonify
 from werkzeug.exceptions import NotFound
 from flask_autoindex import AutoIndex
 from flask_httpauth import HTTPDigestAuth, HTTPTokenAuth, MultiAuth
 from flask_apscheduler import APScheduler
 import requests
 from requests.exceptions import HTTPError
-from requests import status_codes
 from dateutil import parser, tz
 import click
 from watchdog.observers import Observer
@@ -46,6 +47,7 @@ DEF_CONFIGS = {
     'mimetypes': {
         'text/plain': ['.m3u', '.m3u8', '.yml', '.yaml', '.toml']
     },
+    'verbose': False,
     'SECRET_KEY': ''.join(random.choices(string.ascii_letters + string.digits, k=64)),
 }
 
@@ -128,16 +130,15 @@ def start_watch_list(app):
 
 def create_app():
     app = Flask(__name__)
+    config = Config(app)
 
     for hdl in app.logger.handlers:
         app.logger.removeHandler(hdl)
     hdl = logging.StreamHandler()
     hdl.setFormatter(logging.Formatter('[%(asctime)s][%(levelname)s] %(message)s'))
     app.logger.addHandler(hdl)
-    if not app.debug:
-        app.logger.setLevel(logging.INFO)
+    app.logger.setLevel(logging.DEBUG if app.debug or app.fastly.verbose else logging.INFO)
 
-    config = Config(app)
     app.extensions['auto_index'] = AutoIndex(app, browse_root=config.dist_dir, add_url_rules=False)
 
     # AUTH
@@ -160,7 +161,6 @@ def create_app():
 
 
 app = create_app()
-
 
 def _re_subs(s, *reps):
     d = (None, '', 0, re.IGNORECASE)
@@ -247,6 +247,7 @@ def get_urls():
 
 def download_single(url):
     try:
+        start = time.perf_counter()
         res = requests.get(url, allow_redirects=True, timeout=app.fastly.download_timeout)
         res.raise_for_status()
         relpath = to_path(url)
@@ -259,27 +260,34 @@ def download_single(url):
             os.utime(abspath, (modified_local.timestamp(), modified_local.timestamp()))
         except:
             pass
+        elapsed = time.perf_counter() - start
         if not privacy:
-            app.logger.info(f'DL({res.elapsed.total_seconds():.2f}): {url} => {relpath}')
-        return True
+            app.logger.info(f'DL({elapsed:.2f}): {url} => {relpath}')
+        return True, url
     except Exception as e:
         if privacy:
             app.logger.error(f'DL {type(e).__name__}: {e}')
         else:
             app.logger.error(f'DL {type(e).__name__}: {url} {e}')
-    return False
+    return False, url
 
 
 def download(urls):
     success_count = 0
     start = datetime.now()
+    success = []
+    fail = []
     with ThreadPoolExecutor(max_workers=app.fastly.download_max_workers) as executor:
         futures = [executor.submit(download_single, url) for url in urls]
         for future in as_completed(futures):
-            if future.result():
-                success_count += 1
+            ret, url = future.result()
+            if ret:
+                success.append(url)
+            else:
+                fail.append(url)
     dt = datetime.now() - start
-    app.logger.info(f'done. {dt.total_seconds():.3f}s {success_count}/{len(urls)}')
+    app.logger.info(f'done. {dt.total_seconds():.3f}s {len(success)}/{len(urls)}')
+    return success, fail
 
 
 def download_local():
@@ -288,7 +296,7 @@ def download_local():
     download(urls)
 
 
-def download_remote(remote, token):
+def download_remote(remote, token, sync=False, callback=False):
     app.logger.info(f'Download remote list...')
     try:
         headers = {}
@@ -296,13 +304,106 @@ def download_remote(remote, token):
             headers['Authorization'] = f'Bearer {token}'
         res = requests.get(remote, headers=headers)
         res.raise_for_status()
-        urls = read_urls(res.content.decode())
-        download(urls)
+        data = res.json()
+        success, fail = download(data.get('urls', []))
     except Exception as e:
         if isinstance(e, HTTPError):
             app.logger.error(f'Download remote fail: {e.response.status_code}')
         else:
             app.logger.error(f'Download remote fail: {e.__class__.__name__}')
+        return
+
+    sync_ret = None
+    if sync:
+        sync_ret = sync_to_server(**data.get('sync'))
+
+    if callback:
+        download_remote_callback(data.get('callback'), token, [success, fail], sync_ret)
+
+
+def download_remote_callback(callback_url, token, result, sync):
+    app.logger.info(f'callback...')
+    try:
+        headers = {}
+        if token:
+            headers['Authorization'] = f'Bearer {token}'
+        res = requests.post(callback_url, headers=headers, json=result)
+        res.raise_for_status()
+        data = res.json()
+        app.logger.info(f'callback done: {data.get("code", None)}')
+    except Exception as e:
+        if isinstance(e, HTTPError):
+            app.logger.error(f'Callback fail: {e.response.status_code}')
+        else:
+            app.logger.error(f'Callback fail: {e}')
+
+
+def sync_to_server(**kwargs):
+    host = kwargs.get('host') or os.getenv('DST_HOST') or app.fastly.sync.get('host')
+    port = kwargs.get('port') or os.getenv('DST_PORT') or app.fastly.sync.get('port', 22)
+    usr = kwargs.get('usr') or os.getenv('DST_USER') or app.fastly.sync.get('user', 'root')
+    key = kwargs.get('key') or os.getenv('DST_KEY') or app.fastly.sync.get('key')
+    dest = kwargs.get('path') or  os.getenv('DST_PATH') or app.fastly.sync.get('path')
+
+    app.logger.info('sync to server...')
+    cmd = f'ssh-keyscan -p {port} {host}'
+    try:
+        with open(os.path.expanduser('~/.ssh/known_hosts'), 'ab') as fp:
+            output = subprocess.check_output(shlex.split(cmd), stderr=subprocess.DEVNULL)
+            fp.write(output)
+    except Exception as e:
+        app.logger.error(f'ssh-keyscan fail: {e}')
+
+    rsh = f'ssh -p {port}'
+    if key:
+        rsh += f' -i {key}'
+    cmd = f'rsync -rlth --checksum --ignore-errors --stats -e "{rsh}" "{app.fastly.dist_dir}/" "{usr}@{host}:{dest}"'
+    try:
+        proc = subprocess.Popen(shlex.split(cmd))
+        proc.wait()
+        app.logger.info('sync done...')
+        return proc.returncode == 0
+    except Exception as e:
+        app.logger.error(f'sync fail: {e}')
+    return False
+
+
+def update_metadata(success, fail):
+    success = success or []
+    fail = fail or []
+    metadata_file = os.path.join(app.fastly.dist_dir, 'metadata.json')
+    try:
+        with open(metadata_file) as fp:
+            pre_data = json.load(fp)
+    except:
+        pre_data = {}
+
+    def _gen_job_data(url, downloaded):
+        relpath = to_path(url)
+        exists = os.path.isfile(get_abspath(relpath))
+        last_update = datetime.now().strftime('%Y-%m-%d %H:%M:%S') if downloaded else None
+        if not downloaded and exists:
+            for j in pre_data.get('job', []):
+                if j.get('remote') == url and j.get('last_update'):
+                    last_update = j.get('last_update')
+                    break
+        return {'remote': url, 'local': relpath,
+                'exists': exists,
+                'last_update': last_update}
+
+    data = {'job': []}
+    for url in success:
+        data['job'].append(_gen_job_data(url, True))
+    for url in fail:
+        data['job'].append(_gen_job_data(url, False))
+
+    with open(metadata_file, 'w') as fp:
+        json.dump(data, fp, indent=2)
+
+    app.logger.debug(f'metadata: {json.dumps(data)}')
+
+    return data
+
 
 
 @app.route('/')
@@ -322,27 +423,55 @@ def serve_file(target):
     return send_file(target)
 
 
-@app.route('/-/list/')
-@app.route('/-/list/<path:path>')
+@app.route('/-/file/')
+@app.route('/-/file/<path:path>')
 @app.extensions['auth'].login_required
 def autoindex(path='.'):
     return app.extensions['auto_index'].render_autoindex(path)
 
 
-@app.route('/-/urls/')
+@app.route('/-/raw/')
 @app.extensions['auth'].login_required
 def dump_urls():
     return '\n'.join(get_urls())
 
 
+@app.route('/-/job/')
+@app.extensions['auth'].login_required
+def view_job():
+    sync_data = app.fastly.sync.copy()
+    sync_data.pop('key', None)
+    if not sync_data.get('path'):
+        sync_data['path'] = app.fastly.dist_dir
+    return jsonify(code=0, urls=get_urls(),
+                   callback=url_for('view_callback', _external=True),
+                   sync=sync_data)
+
+
+# 回报
+# 数据: [[],[]]
+@app.route('/-/callback/', methods=['POST'])
+@app.extensions['auth'].login_required
+def view_callback():
+    try:
+        data = request.json
+        app.logger.debug('callback data: {data}')
+    except Exception as e:
+        app.logger.warning(f'report data fail: {request.remote_addr} {e}')
+        return jsonify(code=1)
+    update_metadata(*data)
+    return jsonify(code=0)
+
+
 @app.cli.command('download')
 @click.option('--remote', default=None)
 @click.option('--token', default=None)
-def cmd_download(**kwargs):
-    remote = kwargs.get('remote')
-    if remote:
-        return download_remote(remote, kwargs.get('token'))
-    return download_local()
+@click.option('--sync', is_flag=True)
+@click.option('--callback', is_flag=True)
+def cmd_download(remote, token, sync, callback):
+    if not remote:
+        return download_local()
+    download_remote(remote, token, sync, callback)
 
 
 @app.cli.command('sync')
@@ -353,23 +482,7 @@ def cmd_download(**kwargs):
 @click.option('--key')
 @click.option('--path')
 def cmd_sync(**kwargs):
-    host = kwargs.get('host') or os.getenv('DST_HOST') or app.fastly.sync.get('host')
-    port = kwargs.get('port') or os.getenv('DST_PORT') or app.fastly.sync.get('port', 22)
-    usr = kwargs.get('usr') or os.getenv('DST_USER') or app.fastly.sync.get('user', 'root')
-    key = kwargs.get('key') or os.getenv('DST_KEY') or app.fastly.sync.get('key')
-    dest = kwargs.get('path') or  os.getenv('DST_PATH') or app.fastly.sync.get('path')
-
-    extra_args = '--delete --delete-excluded' if kwargs.get('force') else ''
-    rsh = f'ssh -p {port}'
-    if key:
-        rsh += f' -i {key}'
-    cmd = f'rsync -rlth --checksum --ignore-errors --stats {extra_args} -e "{rsh}" "{app.fastly.dist_dir}/" "{usr}@{host}:{dest}"'
-    try:
-        app.logger.info('sync to server...')
-        proc = subprocess.Popen(shlex.split(cmd))
-        proc.wait()
-    except Exception as e:
-        app.logger.error(f'sync fail: {e}')
+    if not sync_to_server(**kwargs):
         raise SystemExit(code=1)
 
 
