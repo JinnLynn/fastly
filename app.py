@@ -1,6 +1,8 @@
 import os
 import sys
 import re
+import shutil
+import tempfile
 import logging
 from urllib.parse import urlparse
 from datetime import datetime, timedelta
@@ -43,7 +45,7 @@ DEF_CONFIGS = {
     'auth_token': ''.join(random.choices(string.ascii_letters + string.digits, k=32)),
     'sync': {},
     'download_max_workers': 25,
-    'download_timeout': (5, 30),
+    'download_timeout': 30,
     'mimetypes': {
         'text/plain': ['.m3u', '.m3u8', '.yml', '.yaml', '.toml']
     },
@@ -248,12 +250,24 @@ def get_urls():
 def download_single(url):
     try:
         start = time.perf_counter()
-        res = requests.get(url, allow_redirects=True, timeout=app.fastly.download_timeout)
+        # requests 的timeout跟通常理解的有差异，指的是连续没有数据下载的时长
+        # 所有有可能在下载速度很慢的情况下，会超出timeout的时间
+        # https://docs.python-requests.org/en/latest/user/quickstart/#timeouts
+        # 使用stream=True 自行判断超时时间
+        res = requests.get(url, timeout=app.fastly.download_timeout, stream=True)
         res.raise_for_status()
+
+        # 使用临时文件 防止下载不完整或覆盖旧文件
+        tmp = tempfile.mktemp()
+        with open(tmp, 'wb') as fp:
+            for chunk in res.iter_content(1024):
+                if time.perf_counter() - start > app.fastly.download_timeout:
+                    raise requests.exceptions.Timeout()
+                fp.write(chunk)
+
         relpath = to_path(url)
         abspath = get_abspath(relpath)
-        with open(abspath, 'wb') as fp:
-            fp.write(res.content)
+        shutil.copy(tmp, abspath)
         try:
             modified = parser.parse(res.headers.get('last-modified'))
             modified_local = modified.astimezone(tz=DEF_TZ)
@@ -455,7 +469,7 @@ def view_job():
 def view_callback():
     try:
         data = request.json
-        app.logger.debug('callback data: {data}')
+        app.logger.debug(f'callback data: {data}')
     except Exception as e:
         app.logger.warning(f'report data fail: {request.remote_addr} {e}')
         return jsonify(code=1)
