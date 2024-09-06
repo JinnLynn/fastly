@@ -328,12 +328,8 @@ def download_remote(remote, token, sync=False, callback=False):
             app.logger.error(f'Download remote fail: {e.__class__.__name__}')
         return
 
-    sync_ret = None
-    if sync:
-        sync_ret = sync_to_server(**data.get('sync'))
-
-    if callback:
-        download_remote_callback(data.get('callback'), token, [success, fail], sync_ret)
+    sync_ret = sync_ret = sync_to_server(**data.get('sync'))
+    download_remote_callback(data.get('callback'), token, [success, fail], sync_ret)
 
 
 def download_remote_callback(callback_url, token, result, sync):
@@ -488,12 +484,10 @@ def view_callback():
 @app.cli.command('download')
 @click.option('--remote', default=None)
 @click.option('--token', default=None)
-@click.option('--sync', is_flag=True)
-@click.option('--callback', is_flag=True)
 def cmd_download(remote, token, sync, callback):
     if not remote:
         return download_local()
-    download_remote(remote, token, sync, callback)
+    download_remote(remote, token)
 
 
 @app.cli.command('sync')
