@@ -1,19 +1,10 @@
 name: fastly
 on:
   workflow_dispatch:
-    inputs:
-      force_sync:
-        default: false
-        required: true
-        type: boolean
-        description: delete files from dest
   schedule:
     - cron: "0 */6 * * *"
   repository_dispatch:
     types: [download]
-env:
-  FORCE_SYNC: ${{ inputs.force_sync }}
-  # FASTLY_PRIVACY: 1
 jobs:
   automate:
     runs-on: ubuntu-24.04
@@ -26,15 +17,19 @@ jobs:
             ssh-private-key: ${{ secrets.DST_SSH_KEY }}
       - uses: actions/checkout@v4
       - name: run
+        env:
+          REMOTE_JOB: ${{ github.event.client_payload.job || secrets.REMOTE_JOB }}
+          REMOTE_TOKEN: ${{ github.event.client_payload.token || secrets.REMOTE_TOKEN }}
         run: |
           set -e
+          echo "::add-mask::${REMOTE_JOB}"
+          echo "::add-mask::${REMOTE_TOKEN}"
 
           echo [$(date "+%Y-%m-%d %H:%M:%S")] "Init..."
           pip install --disable-pip-version-check -q -r requirements.txt
 
           echo [$(date "+%Y-%m-%d %H:%M:%S")] "Download..."
-          flask download --remote ${{ secrets.REMOTE_JOB }} \
-                        --token ${{ secrets.REMOTE_TOKEN }} \
-                        --sync --callback
+          flask download --remote ${REMOTE_JOB} \
+                        --token ${REMOTE_TOKEN}
 
           echo [$(date "+%Y-%m-%d %H:%M:%S")] "Done."

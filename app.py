@@ -38,6 +38,7 @@ privacy = os.getenv('FASTLY_PRIVACY') or os.getenv('GITHUB_ACTION')
 
 DEF_TZ = tz.gettz('Asia/Shanghai')
 DEF_TEXT_TYPES = ['.m3u', '.m3u8', '.yml', '.yaml']
+DEF_MIN_DOWNLOAD_INTERVAL = 5
 DEF_CONFIGS = {
     'dist_dir': 'dist',
     'list_dir': 'list',
@@ -46,7 +47,9 @@ DEF_CONFIGS = {
     'auth_token': ''.join(random.choices(string.ascii_letters + string.digits, k=32)),
     'sync': {},
     'download_max_workers': 25,
-    'download_timeout': 30,
+    'download_timeout': 60,     # 秒
+    'download_interval': 180,   # 分
+    'download_at_start': False,
     'mimetypes': {
         'text/plain': ['.m3u', '.m3u8', '.yml', '.yaml', '.toml']
     },
@@ -70,7 +73,13 @@ class Config(Namespace):
             data.setdefault(k, v)
         data.update(dist_dir=os.path.join(app.root_path, data['dist_dir']),
                     list_dir=os.path.join(app.root_path, data['list_dir']))
+
+        data.update(_internal=Namespace(job_url=None))
+        data.update(download_interval=max(data['download_interval'], DEF_MIN_DOWNLOAD_INTERVAL))
+
+        # 载入到Flask，由于Flask.config的规定只有全大写的配置才会被读入
         app.config.from_mapping(data)
+        app.logger
         return data
 
     def __getattr__(self, name):
@@ -81,23 +90,40 @@ class Config(Namespace):
 
 
 def dispatch_github_action(app, *args, **kwargs):
-    if not app.fastly.github_token or not app.fastly.github_repository:
-        app.logger.error('Github token or repository missing.')
-        return False
-    headers = {
-        'Accept': 'application/vnd.github.everest-preview+json',
-        'Authorization': f'token {app.fastly.github_token}'
-    }
-    try:
-        res = requests.post(f'https://api.github.com/repos/{app.fastly.github_repository}/dispatches',
-                            json={'event_type': 'download'}, headers=headers)
-        res.raise_for_status()
-        if res.status_code == 204:
-            app.logger.info('Github Action job dispatched.')
-            return True
-    except:
-        app.logger.error('Dispatch Github-action job fail.')
+    with app.app_context():
+        if not app.fastly.github_token or not app.fastly.github_repository:
+            app.logger.error('Github token or repository missing.')
+            return False
+        if not app.fastly.job_url:
+            app.logger.warning('job_url dismissing.')
+            return
+        if app.fastly._internal.job_url and app.fastly.job_url != app.fastly._internal.job_url:
+            app.logger.warning(f'job_url mismatching: {app.fastly.job_url} {app.fastly._internal.job_url}')
+        headers = {
+            'Accept': 'application/vnd.github+json',
+            'Authorization': f'token {app.fastly.github_token}'
+        }
+        event_type = 'download'
+        payload = {
+            'job': app.fastly.job_url,
+            'token': app.fastly.auth_token
+        }
+        # print(payload)
+        # return
+        try:
+            res = requests.post(f'https://api.github.com/repos/{app.fastly.github_repository}/dispatches',
+                                json={'event_type': event_type, 'client_payload': payload}, headers=headers)
+            res.raise_for_status()
+            if res.status_code == 204:
+                app.logger.info(f'Github Action job dispatched: {event_type} {payload}')
+                return True
+        except:
+            app.logger.error('Dispatch Github-action job fail: {event_type} {payload}')
     return False
+
+
+def delay_timestamp(seconds):
+    return datetime.now() + timedelta(seconds=seconds)
 
 
 class WatchHandler(FileSystemEventHandler):
@@ -113,7 +139,7 @@ class WatchHandler(FileSystemEventHandler):
         app.logger.info(f'File Event[{event.event_type}]: {event.src_path}')
         # 添加到一次任务延时执行，防止多次响应
         app.apscheduler.add_job('dowonload_when_list_change', dispatch_github_action,
-                                trigger='date', run_date=datetime.now() + timedelta(seconds=3),
+                                trigger='date', run_date=delay_timestamp(3),
                                 args=(self.app, ), kwargs={'event': 'WATCH'},
                                 replace_existing=True)
 
@@ -140,7 +166,11 @@ def create_app():
     hdl = logging.StreamHandler()
     hdl.setFormatter(logging.Formatter('[%(asctime)s][%(levelname)s] %(message)s'))
     app.logger.addHandler(hdl)
-    app.logger.setLevel(logging.DEBUG if app.debug or app.fastly.verbose else logging.INFO)
+    if app.debug or app.fastly.verbose:
+        app.logger.setLevel(logging.DEBUG)
+    else:
+        app.logger.setLevel(logging.INFO)
+        logging.getLogger('apscheduler').setLevel(logging.DEBUG)
 
     app.extensions['auto_index'] = AutoIndex(app, browse_root=config.dist_dir, add_url_rules=False)
 
@@ -151,19 +181,30 @@ def create_app():
     _token_auth.verify_token_callback = lambda t: config.auth_usr if t == config.auth_token else None
     app.extensions['auth'] = MultiAuth(_digest_auth, _token_auth)
 
-    scheduler = APScheduler(app=app)
-    if config.watch_list:
-        start_watch_list(app)
-    scheduler.start()
-
     for t, exts in config.mimetypes.items():
         for ext in exts:
             mimetypes.add_type(t, ext)
+
+    scheduler = APScheduler(app=app)
+    if config.watch_list:
+        start_watch_list(app)
+    if config.download_interval > 0:
+        app.logger.info(f'Auto download interval: {config.download_interval}m')
+        scheduler.add_job('auto_download', dispatch_github_action,
+                          trigger='interval', minutes=config.download_interval,
+                          args=(app, ), replace_existing=True)
+    if config.download_at_start:
+        app.logger.info(f'Download immediately in: 5s')
+        app.apscheduler.add_job('dowonload_at_start', dispatch_github_action,
+                                trigger='date', run_date=delay_timestamp(5),
+                                args=(app, ), replace_existing=True)
+    scheduler.start()
 
     return app
 
 
 app = create_app()
+
 
 def _re_subs(s, *reps):
     d = (None, '', 0, re.IGNORECASE)
@@ -311,7 +352,7 @@ def download_local():
     download(urls)
 
 
-def download_remote(remote, token, sync=False, callback=False):
+def download_remote(remote, token):
     app.logger.info(f'Download remote list...')
     try:
         headers = {}
@@ -423,6 +464,15 @@ def update_metadata(success, fail):
     return data
 
 
+@app.before_request
+def before_request():
+    if not app.fastly.job_url:
+        app.fastly.job_url = url_for('.view_job', _external=True)
+    if not app.fastly._internal.job_url:
+        app.fastly._internal.job_url = url_for('.view_job', _external=True)
+
+
+
 @app.route('/')
 def index():
     if 'q' in request.args:
@@ -465,6 +515,18 @@ def view_job():
                    sync=sync_data)
 
 
+@app.route('/-/job1/')
+@app.extensions['auth'].login_required
+def view_job1():
+    sync_data = app.fastly.sync.copy()
+    sync_data.pop('key', None)
+    if not sync_data.get('path'):
+        sync_data['path'] = app.fastly.dist_dir
+    return jsonify(code=0, urls=get_urls(),
+                   callback=url_for('view_callback', _external=True),
+                   sync=sync_data)
+
+
 # 回报
 # 数据: [[],[]]
 @app.route('/-/callback/', methods=['POST'])
@@ -484,7 +546,7 @@ def view_callback():
 @app.cli.command('download')
 @click.option('--remote', default=None)
 @click.option('--token', default=None)
-def cmd_download(remote, token, sync, callback):
+def cmd_download(remote, token):
     if not remote:
         return download_local()
     download_remote(remote, token)
@@ -502,6 +564,7 @@ def cmd_sync(**kwargs):
         raise SystemExit(code=1)
 
 
-@app.cli.command('action')
-def cmd_github_action():
-    dispatch_github_action(app)
+# TODO
+# @app.cli.command('clean')
+# def cmd_clean():
+#     pass
