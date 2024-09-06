@@ -33,7 +33,8 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler, \
     EVENT_TYPE_MOVED, EVENT_TYPE_DELETED, EVENT_TYPE_CREATED, EVENT_TYPE_MODIFIED
 
-privacy = os.getenv('FASTLY_PRIVACY')
+# 隐私模式 Github Action下默认开启
+privacy = os.getenv('FASTLY_PRIVACY') or os.getenv('GITHUB_ACTION')
 
 DEF_TZ = tz.gettz('Asia/Shanghai')
 DEF_TEXT_TYPES = ['.m3u', '.m3u8', '.yml', '.yaml']
@@ -359,6 +360,10 @@ def sync_to_server(**kwargs):
     key = kwargs.get('key') or os.getenv('DST_KEY') or app.fastly.sync.get('key')
     dest = kwargs.get('path') or  os.getenv('DST_PATH') or app.fastly.sync.get('path')
 
+    if not host or not port or not usr or not dest:
+        app.logger.error(f'Sync fail: incomplete server information')
+        return False
+
     app.logger.info('sync to server...')
     cmd = f'ssh-keyscan -p {port} {host}'
     try:
@@ -392,10 +397,13 @@ def update_metadata(success, fail):
     except:
         pre_data = {}
 
+    def _get_datetime():
+        return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
     def _gen_job_data(url, downloaded):
         relpath = to_path(url)
         exists = os.path.isfile(get_abspath(relpath))
-        last_update = datetime.now().strftime('%Y-%m-%d %H:%M:%S') if downloaded else None
+        last_update = _get_datetime() if downloaded else None
         if not downloaded and exists:
             for j in pre_data.get('job', []):
                 if j.get('remote') == url and j.get('last_update'):
@@ -411,13 +419,12 @@ def update_metadata(success, fail):
     for url in fail:
         data['job'].append(_gen_job_data(url, False))
 
+    data['last_update'] = _get_datetime()
+
     with open(metadata_file, 'w') as fp:
         json.dump(data, fp, indent=2)
 
-    app.logger.debug(f'metadata: {json.dumps(data)}')
-
     return data
-
 
 
 @app.route('/')
@@ -469,9 +476,10 @@ def view_job():
 def view_callback():
     try:
         data = request.json
-        app.logger.debug(f'callback data: {data}')
+        if data[1]:
+            app.logger.warning(f'CB download fail: {data[1]}')
     except Exception as e:
-        app.logger.warning(f'report data fail: {request.remote_addr} {e}')
+        app.logger.warning(f'CB data fail: {request.remote_addr} {e}')
         return jsonify(code=1)
     update_metadata(*data)
     return jsonify(code=0)
