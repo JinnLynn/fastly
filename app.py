@@ -19,6 +19,8 @@ from argparse import Namespace
 from glob import glob
 import threading
 import json
+from base64 import b64decode, b64encode
+import zlib
 
 from flask import Flask, send_file as _send_file, redirect, request, url_for, jsonify
 from werkzeug.exceptions import NotFound
@@ -38,7 +40,8 @@ privacy = os.getenv('FASTLY_PRIVACY') or os.getenv('GITHUB_ACTION')
 
 DEF_TZ = tz.gettz('Asia/Shanghai')
 DEF_TEXT_TYPES = ['.m3u', '.m3u8', '.yml', '.yaml']
-DEF_MIN_DOWNLOAD_INTERVAL = 5
+DEF_MIN_DOWNLOAD_INTERVAL = 10
+DEF_JOB_METHOD = 'batch'
 DEF_CONFIGS = {
     'dist_dir': 'dist',
     'list_dir': 'list',
@@ -48,7 +51,7 @@ DEF_CONFIGS = {
     'sync': {},
     'download_max_workers': 25,
     'download_timeout': 60,     # 秒
-    'download_interval': 180,   # 分
+    'download_interval': -1,   # 分
     'download_at_start': False,
     'mimetypes': {
         'text/plain': ['.m3u', '.m3u8', '.yml', '.yaml', '.toml']
@@ -75,8 +78,9 @@ class Config(Namespace):
                     list_dir=os.path.join(app.root_path, data['list_dir']))
 
         data.update(_internal=Namespace(job_url=None))
-        data.update(download_interval=max(data['download_interval'], DEF_MIN_DOWNLOAD_INTERVAL))
-
+        download_interval = data['download_interval']
+        download_interval = max(download_interval, DEF_MIN_DOWNLOAD_INTERVAL) if download_interval > 0 else download_interval
+        data.update(download_interval=download_interval)
         # 载入到Flask，由于Flask.config的规定只有全大写的配置才会被读入
         app.config.from_mapping(data)
         app.logger
@@ -111,15 +115,21 @@ def dispatch_github_action(app, *args, **kwargs):
         # print(payload)
         # return
         try:
+            #REF: https://docs.github.com/en/rest/repos/repos?apiVersion=2022-11-28#create-a-repository-dispatch-event
             res = requests.post(f'https://api.github.com/repos/{app.fastly.github_repository}/dispatches',
                                 json={'event_type': event_type, 'client_payload': payload}, headers=headers)
             res.raise_for_status()
             if res.status_code == 204:
                 app.logger.info(f'Github Action job dispatched: {event_type} {payload}')
                 return True
+            res.headers
         except:
             app.logger.error('Dispatch Github-action job fail: {event_type} {payload}')
     return False
+
+
+def dispatch_github_action_by_data(urls):
+    pass
 
 
 def delay_timestamp(seconds):
@@ -206,6 +216,18 @@ def create_app():
 app = create_app()
 
 
+# bytes => compress => b64encode => str
+def encode(data):
+    return b64encode(zlib.compress(data)).decode()
+
+
+# [str =>] bytes => b64decode => decompress => bytes
+def decode(data):
+    if isinstance(data, str):
+        data = data.encode()
+    return zlib.decompress(b64decode(data))
+
+
 def _re_subs(s, *reps):
     d = (None, '', 0, re.IGNORECASE)
     for rep in reps:
@@ -289,58 +311,70 @@ def get_urls():
     return list(urls)
 
 
-def download_single(url):
+# save: 是否保存为文件 True则保存文件并返回文件路径 否则返回bytes
+def download_single(data, save=True):
+    data = {'url': data} if not isinstance(data, dict) else data
+    url = data.get('url')
+    ua = data.get('ua')
+    headers = data.get('headers', {})
     try:
         start = time.perf_counter()
+        if ua:
+            headers['User-Agent'] = ua
         # requests 的timeout跟通常理解的有差异，指的是连续没有数据下载的时长
         # 所有有可能在下载速度很慢的情况下，会超出timeout的时间
         # https://docs.python-requests.org/en/latest/user/quickstart/#timeouts
         # 使用stream=True 自行判断超时时间
-        res = requests.get(url, timeout=app.fastly.download_timeout, stream=True)
+        res = requests.get(url, timeout=app.fastly.download_timeout, stream=True, headers=headers)
         res.raise_for_status()
 
         # 使用临时文件 防止下载不完整或覆盖旧文件
         tmp = tempfile.mktemp()
-        with open(tmp, 'wb') as fp:
-            for chunk in res.iter_content(1024):
-                if time.perf_counter() - start > app.fastly.download_timeout:
-                    raise requests.exceptions.Timeout()
-                fp.write(chunk)
+        raw = b''
+        for chunk in res.iter_content(1024):
+            if time.perf_counter() - start > app.fastly.download_timeout:
+                raise requests.exceptions.Timeout()
+            raw += chunk
 
         relpath = to_path(url)
         abspath = get_abspath(relpath)
-        shutil.copy(tmp, abspath)
-        try:
-            modified = parser.parse(res.headers.get('last-modified'))
-            modified_local = modified.astimezone(tz=DEF_TZ)
-            os.utime(abspath, (modified_local.timestamp(), modified_local.timestamp()))
-        except:
-            pass
+        if save:
+            with open(abspath, 'wb') as fp:
+                fp.write(raw)
+
+            try:
+                modified = parser.parse(res.headers.get('last-modified'))
+                modified_local = modified.astimezone(tz=DEF_TZ)
+                os.utime(abspath, (modified_local.timestamp(), modified_local.timestamp()))
+            except:
+                pass
+
         elapsed = time.perf_counter() - start
         if not privacy:
-            app.logger.info(f'DL({elapsed:.2f}): {url} => {relpath}')
-        return True, url
+            app.logger.info(f'DL({elapsed:.2f}): {url} => {relpath if save else "<RAW>"}')
+        return True, url, abspath if save else (raw, res.headers), data
     except Exception as e:
         if privacy:
             app.logger.error(f'DL {type(e).__name__}: {e}')
         else:
             app.logger.error(f'DL {type(e).__name__}: {url} {e}')
-    return False, url
+    return False, url, None, None
+
+
+def batch_download(urls, save=True):
+    with ThreadPoolExecutor(max_workers=app.fastly.download_max_workers) as executor:
+        futures = [executor.submit(download_single, url, save=save) for url in urls]
+        for future in as_completed(futures):
+            ret, url, dest, org = future.result()
+            yield ret, url, dest, org
 
 
 def download(urls):
-    success_count = 0
     start = datetime.now()
     success = []
     fail = []
-    with ThreadPoolExecutor(max_workers=app.fastly.download_max_workers) as executor:
-        futures = [executor.submit(download_single, url) for url in urls]
-        for future in as_completed(futures):
-            ret, url = future.result()
-            if ret:
-                success.append(url)
-            else:
-                fail.append(url)
+    for ret, url, dest, _ in batch_download(urls):
+        (success if ret else fail).append(url)
     dt = datetime.now() - start
     app.logger.info(f'done. {dt.total_seconds():.3f}s {len(success)}/{len(urls)}')
     return success, fail
@@ -353,44 +387,71 @@ def download_local():
 
 
 def download_remote(remote, token):
-    app.logger.info(f'Download remote list...')
+    # try:
+    headers = {}
+    if token:
+        headers['Authorization'] = f'Bearer {token}'
+    res = requests.get(remote, headers=headers)
+    res.raise_for_status()
+    data = res.json()
+    if data.get('method') == 'one':
+        download_remote_one_by_one(token, data)
+    else:
+        download_remote_batch(token, data)
+    # except Exception as e:
+    #     if isinstance(e, HTTPError):
+    #         app.logger.error(f'Download remote fail: {e.response.status_code}')
+    #     else:
+    #         app.logger.error(f'Download remote fail: {e.__class__.__name__}')
+    #     return
+
+
+def download_remote_batch(token, data):
+    app.logger.info(f'Download remote batch...')
+    success, fail = download(data.get('urls', []))
+
+    sync_ret = rsync_to_server(**data.get('sync'))
+    callback(data.get('callback'), token, {'result': [sync_ret, success, fail], 'method': 'batch'})
+
+
+def download_remote_one_by_one(token, data):
+    urls = data.get('urls', [])
+    start = time.perf_counter()
+    success_count = 0
+    for ret, url, ret_data, req in batch_download(urls, save=False):
+        if not ret:
+            continue
+        success_count += 1
+        raw, headers = ret_data
+        callback(data.get('callback'), token, {'raw': encode(raw),
+                                               'headers': dict(headers),
+                                               'request': req,
+                                               'method': 'one'})
+
+    app.logger.info(f'done. {time.perf_counter() - start:.3f}s {success_count}/{len(urls)}')
+
+
+def callback(url, token, data):
     try:
         headers = {}
         if token:
             headers['Authorization'] = f'Bearer {token}'
-        res = requests.get(remote, headers=headers)
+        res = requests.post(url, headers=headers, json=data)
         res.raise_for_status()
         data = res.json()
-        success, fail = download(data.get('urls', []))
-    except Exception as e:
-        if isinstance(e, HTTPError):
-            app.logger.error(f'Download remote fail: {e.response.status_code}')
-        else:
-            app.logger.error(f'Download remote fail: {e.__class__.__name__}')
-        return
-
-    sync_ret = sync_ret = sync_to_server(**data.get('sync'))
-    download_remote_callback(data.get('callback'), token, [success, fail], sync_ret)
-
-
-def download_remote_callback(callback_url, token, result, sync):
-    app.logger.info(f'callback...')
-    try:
-        headers = {}
-        if token:
-            headers['Authorization'] = f'Bearer {token}'
-        res = requests.post(callback_url, headers=headers, json=result)
-        res.raise_for_status()
-        data = res.json()
+        if data.get('code') != 0:
+            raise ValueError()
         app.logger.info(f'callback done: {data.get("code", None)}')
+        return True
     except Exception as e:
         if isinstance(e, HTTPError):
             app.logger.error(f'Callback fail: {e.response.status_code}')
         else:
             app.logger.error(f'Callback fail: {e}')
+    return False
 
 
-def sync_to_server(**kwargs):
+def rsync_to_server(**kwargs):
     host = kwargs.get('host') or os.getenv('DST_HOST') or app.fastly.sync.get('host')
     port = kwargs.get('port') or os.getenv('DST_PORT') or app.fastly.sync.get('port', 22)
     usr = kwargs.get('usr') or os.getenv('DST_USER') or app.fastly.sync.get('user', 'root')
@@ -472,7 +533,6 @@ def before_request():
         app.fastly._internal.job_url = url_for('.view_job', _external=True)
 
 
-
 @app.route('/')
 def index():
     if 'q' in request.args:
@@ -511,21 +571,36 @@ def view_job():
     if not sync_data.get('path'):
         sync_data['path'] = app.fastly.dist_dir
     return jsonify(code=0, urls=get_urls(),
+                   method=DEF_JOB_METHOD,
                    callback=url_for('view_callback', _external=True),
                    sync=sync_data)
 
 
-@app.route('/-/job1/')
-@app.extensions['auth'].login_required
-def view_job1():
-    sync_data = app.fastly.sync.copy()
-    sync_data.pop('key', None)
-    if not sync_data.get('path'):
-        sync_data['path'] = app.fastly.dist_dir
-    return jsonify(code=0, urls=get_urls(),
-                   callback=url_for('view_callback', _external=True),
-                   sync=sync_data)
+def callback_save_batch(data):
+    result, success, fail = data.get('result')
+    if not result:
+        app.logger.warning('CB: remote download sync fail')
+        return False
+    update_metadata(success, fail)
+    return True
 
+
+def callback_save_one(data):
+    print(data)
+    req = data.get('request', {})
+    url = req.get('url')
+    if not url:
+        return False
+    try:
+        raw = decode(data.get('raw'))
+        relpath = to_path(url)
+        abspath = get_abspath(relpath)
+        with open(abspath, 'wb') as fp:
+            fp.write(raw)
+    except Exception as e:
+        app.logger.error(f'callback fail one: {e}')
+        return False
+    return True
 
 # 回报
 # 数据: [[],[]]
@@ -534,22 +609,22 @@ def view_job1():
 def view_callback():
     try:
         data = request.json
-        if data[1]:
-            app.logger.warning(f'CB download fail: {data[1]}')
     except Exception as e:
         app.logger.warning(f'CB data fail: {request.remote_addr} {e}')
         return jsonify(code=1)
-    update_metadata(*data)
-    return jsonify(code=0)
+
+    ret = callback_save_one(data) if data.get('method') == 'one' else callback_save_batch(data)
+    return jsonify(code=0 if ret else 1)
 
 
 @app.cli.command('download')
 @click.option('--remote', default=None)
 @click.option('--token', default=None)
 def cmd_download(remote, token):
-    if not remote:
-        return download_local()
-    download_remote(remote, token)
+    if remote:
+        return download_remote(remote, token)
+    return download_local()
+
 
 
 @app.cli.command('sync')
@@ -560,7 +635,7 @@ def cmd_download(remote, token):
 @click.option('--key')
 @click.option('--path')
 def cmd_sync(**kwargs):
-    if not sync_to_server(**kwargs):
+    if not rsync_to_server(**kwargs):
         raise SystemExit(code=1)
 
 
