@@ -16,14 +16,18 @@ jobs:
         with:
             ssh-private-key: ${{ secrets.DST_SSH_KEY }}
       - uses: actions/checkout@v4
+      # REF: https://github.com/actions/runner/issues/643#issuecomment-823537871
+      - run: |
+          INP_JOB=$(jq -r '.client_payload.job' $GITHUB_EVENT_PATH)
+          INP_TOKEN=$(jq -r '.client_payload.token' $GITHUB_EVENT_PATH)
+          echo "::add-mask::$INP_JOB"
+          echo "::add-mask::$INP_TOKEN"
       - name: run
         env:
           REMOTE_JOB: ${{ github.event.client_payload.job || secrets.REMOTE_JOB }}
           REMOTE_TOKEN: ${{ github.event.client_payload.token || secrets.REMOTE_TOKEN }}
         run: |
           set -e
-          echo "::add-mask::${REMOTE_JOB}"
-          echo "::add-mask::${REMOTE_TOKEN}"
 
           echo [$(date "+%Y-%m-%d %H:%M:%S")] "Init..."
           pip install --disable-pip-version-check -q -r requirements.txt
