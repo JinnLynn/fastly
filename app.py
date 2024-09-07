@@ -43,6 +43,7 @@ DEF_TEXT_TYPES = ['.m3u', '.m3u8', '.yml', '.yaml']
 DEF_MIN_DOWNLOAD_INTERVAL = 600
 DEF_JOB_METHOD = 'batch'
 DEF_JOB_DESC = 'fastly'
+DEF_DISPATCH_EVENT_TYPE = 'fastly'
 DEF_CONFIGS = {
     'dist_dir': 'dist',
     'list_dir': 'list',
@@ -125,7 +126,7 @@ def create_app():
     app = Flask(__name__)
     app.register_blueprint(main)
     app.cli.add_command(cmd_download, 'download')
-    app.cli.add_command(cmd_action, 'action')
+    app.cli.add_command(cmd_dispatch, 'dispatch')
 
     for hdl in app.logger.handlers:
         app.logger.removeHandler(hdl)
@@ -173,7 +174,7 @@ def dispatch_github_action():
         'Accept': 'application/vnd.github+json',
         'Authorization': f'token {config.github_token}'
     }
-    event_type = 'download'
+    event_type = DEF_DISPATCH_EVENT_TYPE
     payload = {
         'job': config.job_url,
         'token': config.auth_token
@@ -641,5 +642,5 @@ def cmd_download(remote, token):
 #     pass
 
 @click.command
-def cmd_action():
+def cmd_dispatch():
     dispatch_github_action()
