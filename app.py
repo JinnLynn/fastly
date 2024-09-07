@@ -40,7 +40,7 @@ privacy = os.getenv('FASTLY_PRIVACY') or os.getenv('GITHUB_ACTION')
 
 DEF_TZ = tz.gettz('Asia/Shanghai')
 DEF_TEXT_TYPES = ['.m3u', '.m3u8', '.yml', '.yaml']
-DEF_MIN_DOWNLOAD_INTERVAL = 10
+DEF_MIN_DOWNLOAD_INTERVAL = 600
 DEF_JOB_METHOD = 'batch'
 DEF_JOB_DESC = 'fastly'
 DEF_CONFIGS = {
@@ -52,7 +52,7 @@ DEF_CONFIGS = {
     'sync': {},
     'download_max_workers': 25,
     'download_timeout': 60,     # 秒
-    'download_interval': -1,   # 分
+    'download_interval': -1,    # 秒
     'download_at_start': False,
     'mimetypes': {
         'text/plain': ['.m3u', '.m3u8', '.yml', '.yaml', '.toml']
@@ -93,10 +93,6 @@ class Config(Namespace):
         return self.__dict__.get(name, default)
 
 class WatchHandler(FileSystemEventHandler):
-    def __init__(self, app):
-        super().__init__()
-        self.app = app
-
     def on_any_event(self, event):
         active_events = [EVENT_TYPE_MOVED, EVENT_TYPE_DELETED, EVENT_TYPE_CREATED, EVENT_TYPE_MODIFIED]
         if event.is_directory or event.event_type not in active_events:
@@ -106,7 +102,8 @@ class WatchHandler(FileSystemEventHandler):
         # 添加到一次任务延时执行，防止多次响应
         scheduler.add_job('dowonload_when_list_change', dispatch_github_action,
                           trigger='date', run_date=delay_timestamp(3),
-                          args=(self.app, ), kwargs={'event': 'WATCH'}, replace_existing=True)
+                          kwargs={'event': 'WATCH'}, replace_existing=True)
+
 
 def create_auth():
     _digest_auth = HTTPDigestAuth()
@@ -128,6 +125,7 @@ def create_app():
     app = Flask(__name__)
     app.register_blueprint(main)
     app.cli.add_command(cmd_download, 'download')
+    app.cli.add_command(cmd_action, 'action')
 
     for hdl in app.logger.handlers:
         app.logger.removeHandler(hdl)
@@ -146,15 +144,13 @@ def create_app():
     if config.watch_list:
         start_watch_list(app)
     if config.download_interval > 0:
-        logger.info(f'Auto download interval: {config.download_interval}m')
+        logger.info(f'Auto download interval: {config.download_interval}')
         scheduler.add_job('auto_download', dispatch_github_action,
-                          trigger='interval', minutes=config.download_interval,
-                          args=(app, ), replace_existing=True)
+                          trigger='interval', minutes=config.download_interval, replace_existing=True)
     if config.download_at_start:
         logger.info(f'Download immediately in: 5s')
         scheduler.add_job('dowonload_at_start', dispatch_github_action,
-                                trigger='date', run_date=delay_timestamp(5),
-                                args=(app, ), replace_existing=True)
+                                trigger='date', run_date=delay_timestamp(5), replace_existing=True)
     scheduler.start()
 
     for t, exts in config.mimetypes.items():
@@ -164,37 +160,36 @@ def create_app():
     return app
 
 
-def dispatch_github_action(app, *args, **kwargs):
-    with app.app_context():
-        if not config.github_token or not config.github_repository:
-            logger.error('Github token or repository missing.')
-            return False
-        if not config.job_url:
-            logger.warning('job_url missing.')
-            return
-        if config._internal.job_url and config.job_url != config._internal.job_url:
-            logger.warning(f'job_url mismatching: {config.job_url} {config._internal.job_url}')
-        headers = {
-            'Accept': 'application/vnd.github+json',
-            'Authorization': f'token {config.github_token}'
-        }
-        event_type = 'download'
-        payload = {
-            'job': config.job_url,
-            'token': config.auth_token
-        }
-        # print(payload)
-        # return
-        try:
-            #REF: https://docs.github.com/en/rest/repos/repos?apiVersion=2022-11-28#create-a-repository-dispatch-event
-            res = requests.post(f'https://api.github.com/repos/{config.github_repository}/dispatches',
-                                json={'event_type': event_type, 'client_payload': payload}, headers=headers)
-            res.raise_for_status()
-            if res.status_code == 204:
-                logger.info(f'Github Action job dispatched: {event_type} {payload}')
-                return True
-        except:
-            logger.error(f'Dispatch Github-action job fail: {event_type} {payload}')
+def dispatch_github_action():
+    if not config.github_token or not config.github_repository:
+        logger.error('Github token or repository missing.')
+        return False
+    if not config.job_url:
+        logger.warning('job_url missing.')
+        return
+    if config._internal.job_url and config.job_url != config._internal.job_url:
+        logger.warning(f'job_url mismatching: {config.job_url} {config._internal.job_url}')
+    headers = {
+        'Accept': 'application/vnd.github+json',
+        'Authorization': f'token {config.github_token}'
+    }
+    event_type = 'download'
+    payload = {
+        'job': config.job_url,
+        'token': config.auth_token
+    }
+    # print(payload)
+    # return
+    try:
+        #REF: https://docs.github.com/en/rest/repos/repos?apiVersion=2022-11-28#create-a-repository-dispatch-event
+        res = requests.post(f'https://api.github.com/repos/{config.github_repository}/dispatches',
+                            json={'event_type': event_type, 'client_payload': payload}, headers=headers)
+        res.raise_for_status()
+        if res.status_code == 204:
+            logger.info(f'Github Action job dispatched: {event_type} {payload}')
+            return True
+    except:
+        logger.error(f'Dispatch Github-action job fail: {event_type} {payload}')
     return False
 
 
@@ -203,14 +198,14 @@ def delay_timestamp(seconds):
 
 
 def start_watch_list(app):
-    def watch_process(app):
+    def watch_process():
         observer = Observer()
-        event_handler = WatchHandler(app)
+        event_handler = WatchHandler()
         observer.schedule(event_handler, config.list_dir, recursive=True)
         observer.start()
         logger.info(f'Watch: {config.list_dir}')
 
-    thread = threading.Thread(target=watch_process, args=[app], daemon=True)
+    thread = threading.Thread(target=watch_process, daemon=True)
     thread.start()
     return thread
 
@@ -619,7 +614,7 @@ def view_callback():
     return jsonify(code=0 if ret else 1)
 
 
-@click.command()
+@click.command
 @click.option('--remote', default=None)
 @click.option('--token', default=None)
 def cmd_download(remote, token):
@@ -644,3 +639,7 @@ def cmd_download(remote, token):
 # @click.command('clean')
 # def cmd_clean():
 #     pass
+
+@click.command
+def cmd_action():
+    dispatch_github_action()
