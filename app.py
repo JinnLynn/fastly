@@ -168,8 +168,6 @@ def dispatch_github_action():
     if not config.job_url:
         logger.warning('job_url missing.')
         return
-    if config._internal.job_url and config.job_url != config._internal.job_url:
-        logger.warning(f'job_url mismatching: {config.job_url} {config._internal.job_url}')
     headers = {
         'Accept': 'application/vnd.github+json',
         'Authorization': f'token {config.github_token}'
@@ -437,7 +435,7 @@ def callback(url, token, data):
         res.raise_for_status()
         data = res.json()
         if data.get('code') != 0:
-            raise ValueError()
+            raise ValueError(f'code {data.get("code")}')
         logger.info(f'callback done: {data.get("code", None)}')
         return True
     except Exception as e:
