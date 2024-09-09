@@ -561,6 +561,12 @@ def index():
     return ' ', 404
 
 
+@main.route('/metadata.json')
+@auth.login_required
+def view_metadata():
+    return send_file('metadata.json')
+
+
 @main.route('/<path:target>')
 def view_serve_file(target):
     parts = urlparse(target)
