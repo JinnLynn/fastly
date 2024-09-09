@@ -1,8 +1,6 @@
 import os
-import sys
+import typing as t
 import re
-import shutil
-import tempfile
 import logging
 from urllib.parse import urlparse
 from datetime import datetime, timedelta
@@ -22,6 +20,7 @@ import json
 from base64 import b64decode, b64encode
 import zlib
 
+import flask
 from flask import Flask, Blueprint, send_file as _send_file, redirect, request, url_for, jsonify
 from werkzeug.exceptions import NotFound
 from flask_autoindex import AutoIndex
@@ -77,9 +76,9 @@ class Config(Namespace):
                     list_dir=os.path.abspath(data['list_dir']))
 
         data.update(_internal=Namespace(job_url=None))
-        download_interval = data['download_interval']
-        download_interval = max(download_interval, DEF_MIN_DOWNLOAD_INTERVAL) if download_interval > 0 else download_interval
-        data.update(download_interval=download_interval)
+        di = data['download_interval']
+        di = max(di, DEF_MIN_DOWNLOAD_INTERVAL) if di > 0 else di
+        data.update(download_interval=di)
 
         return data
 
@@ -92,6 +91,7 @@ class Config(Namespace):
 
     def get(self, name, default=None):
         return self.__dict__.get(name, default)
+
 
 class WatchHandler(FileSystemEventHandler):
     def on_any_event(self, event):
@@ -106,13 +106,14 @@ class WatchHandler(FileSystemEventHandler):
                           kwargs={'event': 'WATCH'}, replace_existing=True)
 
 
-def create_auth():
+def create_auth() -> MultiAuth:
     _digest_auth = HTTPDigestAuth()
     _digest_auth.get_password_callback = lambda u: config.auth_pwd if u == config.auth_usr else None
     _token_auth = HTTPTokenAuth()
     _token_auth.verify_token_callback = lambda t: config.auth_usr if t == config.auth_token else None
 
     return MultiAuth(_digest_auth, _token_auth)
+
 
 # ===
 main = Blueprint('main', __name__)
@@ -122,7 +123,8 @@ auto_index = AutoIndex(main, browse_root=config.dist_dir, add_url_rules=False)
 auth = create_auth()
 scheduler = APScheduler()
 
-def create_app():
+
+def create_app() -> Flask:
     app = Flask(__name__)
     app.register_blueprint(main)
     app.cli.add_command(cmd_download, 'download')
@@ -149,19 +151,19 @@ def create_app():
         scheduler.add_job('auto_download', dispatch_github_action,
                           trigger='interval', minutes=config.download_interval, replace_existing=True)
     if config.download_at_start:
-        logger.info(f'Download immediately in: 5s')
+        logger.info('Download immediately in: 5s')
         scheduler.add_job('dowonload_at_start', dispatch_github_action,
-                                trigger='date', run_date=delay_timestamp(5), replace_existing=True)
+                          trigger='date', run_date=delay_timestamp(5), replace_existing=True)
     scheduler.start()
 
-    for t, exts in config.mimetypes.items():
+    for type_, exts in config.mimetypes.items():
         for ext in exts:
-            mimetypes.add_type(t, ext)
+            mimetypes.add_type(type_, ext)
 
     return app
 
 
-def dispatch_github_action():
+def dispatch_github_action() -> bool:
     if not config.github_token or not config.github_repository:
         logger.error('Github token or repository missing.')
         return False
@@ -180,7 +182,7 @@ def dispatch_github_action():
     # print(payload)
     # return
     try:
-        #REF: https://docs.github.com/en/rest/repos/repos?apiVersion=2022-11-28#create-a-repository-dispatch-event
+        # REF: https://docs.github.com/en/rest/repos/repos?apiVersion=2022-11-28#create-a-repository-dispatch-event
         res = requests.post(f'https://api.github.com/repos/{config.github_repository}/dispatches',
                             json={'event_type': event_type, 'client_payload': payload}, headers=headers)
         res.raise_for_status()
@@ -192,11 +194,11 @@ def dispatch_github_action():
     return False
 
 
-def delay_timestamp(seconds):
+def delay_timestamp(seconds: int) -> datetime:
     return datetime.now() + timedelta(seconds=seconds)
 
 
-def start_watch_list(app):
+def start_watch_list(app: Flask) -> threading.Thread:
     def watch_process():
         observer = Observer()
         event_handler = WatchHandler()
@@ -210,18 +212,18 @@ def start_watch_list(app):
 
 
 # bytes => compress => b64encode => str
-def encode(data):
+def encode(data: bytes) -> str:
     return b64encode(zlib.compress(data)).decode()
 
 
 # [str =>] bytes => b64decode => decompress => bytes
-def decode(data):
+def decode(data: str | bytes) -> bytes:
     if isinstance(data, str):
         data = data.encode()
     return zlib.decompress(b64decode(data))
 
 
-def _re_subs(s, *reps):
+def _re_subs(s: str, *reps: tuple) -> str:
     d = (None, '', 0, re.IGNORECASE)
     for rep in reps:
         rep = list(rep) + [d[i] for i in range(len(rep), len(d))]
@@ -231,30 +233,30 @@ def _re_subs(s, *reps):
     return s
 
 
-def calc_hash(*args):
+def calc_hash(*args: str) -> str:
     m = hashlib.sha256()
     for s in args:
         m.update(s.encode())
     return m.hexdigest()[0:12]
 
 
-def is_url(s):
+def is_url(s: str) -> bool:
     parts = urlparse(s)
     return parts.scheme and parts.netloc
 
 
-def clear_scheme(url):
+def clear_scheme(url: str) -> str:
     p = urlparse(url)
     return re.sub(fr'^{p.scheme}:/+', '', url)
 
 
 # FIX: 地址中有query时还有问题
-def to_path(s):
+def to_path(s: str) -> str:
     parts = urlparse(s)
     netloc = '/'.join(parts.netloc.split(':'))                     # 网址端口转为子目录
     path = _re_subs(parts.path,
-                        (r'^/+', ),                         # 去除开头的/
-                        (r'[ :]+', '-')                     # 空格 : => -
+                    (r'^/+', ),                         # 去除开头的/
+                    (r'[ :]+', '-')                     # 空格 : => -
                     )
     relpath = os.path.join(netloc, path)
     if parts.query:                                         # 地址包含查询
@@ -265,14 +267,14 @@ def to_path(s):
     return relpath
 
 
-def get_abspath(relpath, mkdir=True):
+def get_abspath(relpath: str, mkdir: bool = True) -> str:
     abspath = os.path.join(config.dist_dir, relpath)
     if mkdir and not os.path.isdir(os.path.dirname(abspath)):
         os.makedirs(os.path.dirname(abspath))
     return abspath
 
 
-def send_file(url_or_path):
+def send_file(url_or_path: str) -> flask.Response | NotFound:
     relpath = to_path(url_or_path)
     abspath = get_abspath(relpath, False)
     if os.path.isfile(abspath):
@@ -282,7 +284,7 @@ def send_file(url_or_path):
     raise NotFound()
 
 
-def read_urls(content):
+def read_urls(content: str) -> list[str]:
     valids = []
     for line in content.splitlines():
         line = line.strip()
@@ -292,7 +294,7 @@ def read_urls(content):
     return valids
 
 
-def get_urls():
+def get_urls() -> list[str]:
     urls = set()
     for f in glob('*.txt', root_dir=config.list_dir):
         try:
@@ -305,7 +307,7 @@ def get_urls():
 
 
 # save: 是否保存为文件 True则保存文件并返回文件路径 否则返回bytes
-def download_single(data, save=True):
+def download_single(data: dict | str, save: bool = True) -> tuple[bool, str, str | tuple[bytes, dict], dict]:
     data = {'url': data} if not isinstance(data, dict) else data
     url = data.get('url')
     ua = data.get('ua')
@@ -322,7 +324,6 @@ def download_single(data, save=True):
         res.raise_for_status()
 
         # 使用临时文件 防止下载不完整或覆盖旧文件
-        tmp = tempfile.mktemp()
         raw = b''
         for chunk in res.iter_content(1024):
             if time.perf_counter() - start > config.download_timeout:
@@ -354,7 +355,7 @@ def download_single(data, save=True):
     return False, url, None, None
 
 
-def batch_download(urls, save=True):
+def batch_download(urls: list[str], save: bool = True) -> t.Iterator[tuple[bool, str, str | tuple[bytes, dict], dict]]:
     with ThreadPoolExecutor(max_workers=config.download_max_workers) as executor:
         futures = [executor.submit(download_single, url, save=save) for url in urls]
         for future in as_completed(futures):
@@ -362,7 +363,7 @@ def batch_download(urls, save=True):
             yield ret, url, dest, org
 
 
-def download(urls):
+def download(urls: list[str | dict]) -> tuple[list[str], list[str]]:
     start = datetime.now()
     success = []
     fail = []
@@ -373,13 +374,13 @@ def download(urls):
     return success, fail
 
 
-def download_local():
+def download_local() -> None:
     logger.info('Download local list...')
     urls = get_urls()
     download(urls)
 
 
-def download_remote(remote, token):
+def download_remote(remote: str, token: str) -> None:
     try:
         headers = {}
         if token:
@@ -400,16 +401,15 @@ def download_remote(remote, token):
             logger.error(f'Download remote fail: {e.response.status_code}')
         else:
             logger.error(f'Download remote fail: {e.__class__.__name__}')
-        return
 
 
-def download_remote_batch(token, data):
+def download_remote_batch(token: str, data: dict) -> None:
     success, fail = download(data.get('urls', []))
     sync_ret = rsync_to_server(**data.get('sync'))
     callback(data.get('callback'), token, {'result': [sync_ret, success, fail], 'method': 'batch'})
 
 
-def download_remote_one_by_one(token, data):
+def download_remote_one_by_one(token: str, data: dict) -> None:
     urls = data.get('urls', [])
     start = time.perf_counter()
     success_count = 0
@@ -426,7 +426,7 @@ def download_remote_one_by_one(token, data):
     logger.info(f'done. {time.perf_counter() - start:.3f}s {success_count}/{len(urls)}')
 
 
-def callback(url, token, data):
+def callback(url: str, token: str, data: dict) -> bool:
     try:
         headers = {}
         if token:
@@ -446,15 +446,15 @@ def callback(url, token, data):
     return False
 
 
-def rsync_to_server(**kwargs):
+def rsync_to_server(**kwargs: str | int) -> bool:
     host = kwargs.get('host') or os.getenv('DST_HOST') or config.sync.get('host')
     port = kwargs.get('port') or os.getenv('DST_PORT') or config.sync.get('port', 22)
     usr = kwargs.get('usr') or os.getenv('DST_USER') or config.sync.get('user', 'root')
     key = kwargs.get('key') or os.getenv('DST_KEY') or config.sync.get('key')
-    dest = kwargs.get('path') or  os.getenv('DST_PATH') or config.sync.get('path')
+    dest = kwargs.get('path') or os.getenv('DST_PATH') or config.sync.get('path')
 
     if not host or not port or not usr or not dest:
-        logger.error(f'Sync fail: incomplete server information')
+        logger.error('Sync fail: incomplete server information')
         return False
 
     logger.info('sync to server...')
@@ -480,7 +480,7 @@ def rsync_to_server(**kwargs):
     return False
 
 
-def update_metadata(success, fail):
+def update_metadata(success: list[str], fail: list[str]) -> dict:
     success = success or []
     fail = fail or []
     metadata_file = os.path.join(config.dist_dir, 'metadata.json')
@@ -518,6 +518,32 @@ def update_metadata(success, fail):
         json.dump(data, fp, indent=2)
 
     return data
+
+
+def callback_save_batch(data: dict) -> bool:
+    result, success, fail = data.get('result')
+    if not result:
+        logger.warning('CB: remote download sync fail')
+        return False
+    update_metadata(success, fail)
+    return True
+
+
+def callback_save_one(data: dict) -> bool:
+    req = data.get('request', {})
+    url = req.get('url')
+    if not url:
+        return False
+    try:
+        raw = decode(data.get('raw'))
+        relpath = to_path(url)
+        abspath = get_abspath(relpath)
+        with open(abspath, 'wb') as fp:
+            fp.write(raw)
+    except Exception as e:
+        logger.error(f'callback fail one: {e}')
+        return False
+    return True
 
 
 @main.before_request
@@ -571,32 +597,6 @@ def view_job():
                    callback=url_for('main.view_callback', _external=True),
                    sync=sync_data)
 
-
-def callback_save_batch(data):
-    result, success, fail = data.get('result')
-    if not result:
-        logger.warning('CB: remote download sync fail')
-        return False
-    update_metadata(success, fail)
-    return True
-
-
-def callback_save_one(data):
-    print(data)
-    req = data.get('request', {})
-    url = req.get('url')
-    if not url:
-        return False
-    try:
-        raw = decode(data.get('raw'))
-        relpath = to_path(url)
-        abspath = get_abspath(relpath)
-        with open(abspath, 'wb') as fp:
-            fp.write(raw)
-    except Exception as e:
-        logger.error(f'callback fail one: {e}')
-        return False
-    return True
 
 # 回报
 # 数据: [[],[]]
