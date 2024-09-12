@@ -169,7 +169,7 @@ def dispatch_github_action() -> bool:
         return False
     if not config.job_url:
         logger.warning('job_url missing.')
-        return
+        return False
     headers = {
         'Accept': 'application/vnd.github+json',
         'Authorization': f'token {config.github_token}'
@@ -226,9 +226,8 @@ def decode(data: str | bytes) -> bytes:
 def _re_subs(s: str, *reps: tuple) -> str:
     d = (None, '', 0, re.IGNORECASE)
     for rep in reps:
-        rep = list(rep) + [d[i] for i in range(len(rep), len(d))]
-        rep.insert(2, s)
-        # print(rep)
+        rep = list(rep) + [d[i] for i in range(len(rep), len(d))]               # type: ignore
+        rep.insert(2, s)                                                        # type: ignore
         s = re.sub(*rep)
     return s
 
@@ -242,7 +241,7 @@ def calc_hash(*args: str) -> str:
 
 def is_url(s: str) -> bool:
     parts = urlparse(s)
-    return parts.scheme and parts.netloc
+    return bool(parts.scheme and parts.netloc)
 
 
 def clear_scheme(url: str) -> str:
@@ -307,9 +306,11 @@ def get_urls() -> list[str]:
 
 
 # save: 是否保存为文件 True则保存文件并返回文件路径 否则返回bytes
-def download_single(data: dict | str, save: bool = True) -> tuple[bool, str, str | tuple[bytes, dict], dict]:
+def download_single(data: dict | str, save: bool = True) -> tuple[bool, str,
+                                                                  str | tuple[bytes, dict] | None,
+                                                                  dict | None]:
     data = {'url': data} if not isinstance(data, dict) else data
-    url = data.get('url')
+    url = data.get('url', '')
     ua = data.get('ua')
     headers = data.get('headers', {})
     try:
@@ -355,7 +356,9 @@ def download_single(data: dict | str, save: bool = True) -> tuple[bool, str, str
     return False, url, None, None
 
 
-def batch_download(urls: list[str], save: bool = True) -> t.Iterator[tuple[bool, str, str | tuple[bytes, dict], dict]]:
+def batch_download(urls: list[str] | list[dict], save: bool = True) -> t.Iterator[tuple[bool, str,
+                                                                                  str | tuple[bytes, dict] | None,
+                                                                                  dict | None]]:
     with ThreadPoolExecutor(max_workers=config.download_max_workers) as executor:
         futures = [executor.submit(download_single, url, save=save) for url in urls]
         for future in as_completed(futures):
@@ -363,7 +366,7 @@ def batch_download(urls: list[str], save: bool = True) -> t.Iterator[tuple[bool,
             yield ret, url, dest, org
 
 
-def download(urls: list[str | dict]) -> tuple[list[str], list[str]]:
+def download(urls: list[str] | list[dict]) -> tuple[list[str], list[str]]:
     start = datetime.now()
     success = []
     fail = []
@@ -405,7 +408,7 @@ def download_remote(remote: str, token: str) -> None:
 
 def download_remote_batch(token: str, data: dict) -> None:
     success, fail = download(data.get('urls', []))
-    sync_ret = rsync_to_server(**data.get('sync'))
+    sync_ret = rsync_to_server(**data.get('sync', {}))
     callback(data.get('callback'), token, {'result': [sync_ret, success, fail], 'method': 'batch'})
 
 
@@ -417,7 +420,7 @@ def download_remote_one_by_one(token: str, data: dict) -> None:
         if not ret:
             continue
         success_count += 1
-        raw, headers = ret_data
+        raw, headers = ret_data     # type: ignore
         callback(data.get('callback'), token, {'raw': encode(raw),
                                                'headers': dict(headers),
                                                'request': req,
@@ -426,7 +429,10 @@ def download_remote_one_by_one(token: str, data: dict) -> None:
     logger.info(f'done. {time.perf_counter() - start:.3f}s {success_count}/{len(urls)}')
 
 
-def callback(url: str, token: str, data: dict) -> bool:
+def callback(url: str | None, token: str, data: dict) -> bool:
+    if not url:
+        logger.error('Callback fail: callback url missing')
+        return False
     try:
         headers = {}
         if token:
@@ -436,7 +442,7 @@ def callback(url: str, token: str, data: dict) -> bool:
         data = res.json()
         if data.get('code') != 0:
             raise ValueError(f'code {data.get("code")}')
-        logger.info(f'callback done: {data.get("code", None)}')
+        # logger.info(f'callback done: {data.get("code", None)}')
         return True
     except Exception as e:
         if isinstance(e, HTTPError):
@@ -521,7 +527,7 @@ def update_metadata(success: list[str], fail: list[str]) -> dict:
 
 
 def callback_save_batch(data: dict) -> bool:
-    result, success, fail = data.get('result')
+    result, success, fail = data.get('result', [False, [], []])
     if not result:
         logger.warning('CB: remote download sync fail')
         return False
@@ -535,7 +541,7 @@ def callback_save_one(data: dict) -> bool:
     if not url:
         return False
     try:
-        raw = decode(data.get('raw'))
+        raw = decode(data.get('raw', ''))
         relpath = to_path(url)
         abspath = get_abspath(relpath)
         with open(abspath, 'wb') as fp:
