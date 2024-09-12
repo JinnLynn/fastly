@@ -353,7 +353,7 @@ def download_single(data: dict | str, save: bool = True) -> tuple[bool, str,
             logger.error(f'DL {type(e).__name__}: {e}')
         else:
             logger.error(f'DL {type(e).__name__}: {url} {e}')
-    return False, url, None, None
+    return False, url, None, data
 
 
 def batch_download(urls: list[str] | list[dict], save: bool = True) -> t.Iterator[tuple[bool, str,
@@ -409,7 +409,7 @@ def download_remote(remote: str, token: str) -> None:
 def download_remote_batch(token: str, data: dict) -> None:
     success, fail = download(data.get('urls', []))
     sync_ret = rsync_to_server(**data.get('sync', {}))
-    callback(data.get('callback'), token, {'result': [sync_ret, success, fail], 'method': 'batch'})
+    callback(data.get('callback'), token, {'result': sync_ret, 'success': success, 'fail': fail, 'method': 'batch'})
 
 
 def download_remote_one_by_one(token: str, data: dict) -> None:
@@ -417,15 +417,12 @@ def download_remote_one_by_one(token: str, data: dict) -> None:
     start = time.perf_counter()
     success_count = 0
     for ret, url, ret_data, req in batch_download(urls, save=False):
-        if not ret:
-            continue
-        success_count += 1
-        raw, headers = ret_data     # type: ignore
-        callback(data.get('callback'), token, {'raw': encode(raw),
-                                               'headers': dict(headers),
-                                               'request': req,
-                                               'method': 'one'})
-
+        cb_data = dict(method='one', result=ret, request=req)
+        if ret:
+            success_count += 1
+            raw, headers = ret_data     # type: ignore
+            cb_data.update(raw=encode(raw), headers=dict(headers))
+        callback(data.get('callback'), token, cb_data)
     logger.info(f'done. {time.perf_counter() - start:.3f}s {success_count}/{len(urls)}')
 
 
@@ -527,10 +524,12 @@ def update_metadata(success: list[str], fail: list[str]) -> dict:
 
 
 def callback_save_batch(data: dict) -> bool:
-    result, success, fail = data.get('result', [False, [], []])
+    result = data.get('result')
     if not result:
         logger.warning('CB: remote download sync fail')
         return False
+    success = data.get('success', [])
+    fail = data.get('fail', [])
     update_metadata(success, fail)
     return True
 
@@ -538,6 +537,9 @@ def callback_save_batch(data: dict) -> bool:
 def callback_save_one(data: dict) -> bool:
     req = data.get('request', {})
     url = req.get('url')
+    if not data.get('result'):
+        logger.error(f'download fail[one]: {url}')
+        return True
     if not url:
         return False
     try:
