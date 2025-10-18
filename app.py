@@ -506,6 +506,7 @@ def update_metadata(success: list[str], fail: list[str]) -> dict:
                     last_update = j.get('last_update')
                     break
         return {'remote': url, 'local': relpath,
+                'url': url_for('main.view_serve_file', target=relpath, _external=True),
                 'exists': exists,
                 'last_update': last_update}
 
