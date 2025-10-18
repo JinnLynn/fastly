@@ -350,7 +350,8 @@ def download_single(data: dict | str, save: bool = True) -> tuple[bool, str,
         return True, url, abspath if save else (raw, res.headers), data
     except Exception as e:
         if privacy:
-            logger.error(f'DL {type(e).__name__}: {e}')
+            p = urlparse(url)
+            logger.error(f'DL {type(e).__name__}: {p.netloc}')
         else:
             logger.error(f'DL {type(e).__name__}: {url} {e}')
     return False, url, None, data
